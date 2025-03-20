@@ -1,14 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import autocast
+import torch.multiprocessing as mp
 import numpy as np
 import os
 import random
 import collections
 import rlcard
 from tqdm.auto import tqdm
-from multiprocessing import Pool, Manager, Lock
+from multiprocessing import Pool, Lock, Array
 from rlcard.agents import RandomAgent, CFRAgent
 import time
 import logging
@@ -46,7 +47,7 @@ learning_rate = 1e-4
 noise_scale = 0.1
 num_tables = 2
 code_version = "v1.7"
-grad_clip_value = 5.0  # Настраиваемый параметр обрезки градиентов
+grad_clip_value = 5.0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -104,7 +105,7 @@ class PrioritizedExperienceBuffer:
         with self.lock:
             priorities = np.array(self.priorities, dtype=np.float32) + 1e-5
             visits = np.array(self.visit_counts, dtype=np.float32) + 1
-            adjusted_priorities = priorities / visits  # Учёт частоты посещений
+            adjusted_priorities = priorities / visits
             probs = adjusted_priorities ** 0.6 / adjusted_priorities.sum()
             indices = np.random.choice(len(self.buffer), batch_size, p=probs)
             samples = [self.buffer[idx] for idx in indices]
@@ -126,8 +127,8 @@ class PrioritizedExperienceBuffer:
 class CardEmbedding(nn.Module):
     def __init__(self):
         super().__init__()
-        self.rank_embedding = nn.Embedding(14, 8)  # +1 для неизвестных рангов
-        self.suit_embedding = nn.Embedding(5, 4)   # +1 для неизвестных мастей
+        self.rank_embedding = nn.Embedding(14, 8)
+        self.suit_embedding = nn.Embedding(5, 4)
         self.error_count = 0
 
     def forward(self, cards):
@@ -139,8 +140,8 @@ class CardEmbedding(nn.Module):
                     ranks.append(Card.get_rank_int(c))
                     suits.append(Card.get_suit_int(c))
                 except:
-                    ranks.append(13)  # Неизвестный ранг
-                    suits.append(4)   # Неизвестная масть
+                    ranks.append(13)
+                    suits.append(4)
             ranks = torch.LongTensor(ranks).to(device)
             suits = torch.LongTensor(suits).to(device)
             return torch.cat([self.rank_embedding(ranks), self.suit_embedding(suits)], dim=-1)
@@ -188,41 +189,39 @@ def extract_cards(state_dict, stage):
 # ========== ПОТОКОБЕЗОПАСНАЯ СТАТИСТИКА ОППОНЕНТОВ ==========
 class SharedOpponentStats:
     def __init__(self):
-        self.manager = Manager()
-        self.stats = self.manager.dict()
         self.lock = Lock()
+        self.stats = [Array('i', [0] * 16) for _ in range(6)]
         self._initialize()
 
     def _initialize(self):
         with self.lock:
             for pid in range(6):
-                self.stats[pid] = self.manager.dict({
-                    stage: self.manager.dict({
-                        'raises': 0,
-                        'folds': 0,
-                        'calls': 0,
-                        'total': 0
-                    }) for stage in ['preflop', 'flop', 'turn', 'river']
-                })
+                for stage in range(4):
+                    for metric in range(4):
+                        self.stats[pid][stage * 4 + metric] = 0
 
     def update(self, player_id, action, stage, bet_size=0):
-        stage_name = ['preflop', 'flop', 'turn', 'river'][np.argmax(stage)]
+        stage_idx = np.argmax(stage)
         with self.lock:
-            s = self.stats[player_id][stage_name]
-            s['total'] += 1
+            idx_base = stage_idx * 4
+            self.stats[player_id][idx_base + 3] += 1
             if action == 0:
-                s['folds'] += 1
+                self.stats[player_id][idx_base + 1] += 1
             elif action == 1:
-                s['calls'] += 1
+                self.stats[player_id][idx_base + 2] += 1
             elif action > 1:
-                s['raises'] += bet_size
+                self.stats[player_id][idx_base + 0] += int(bet_size)
 
     def get_behavior(self, player_id, stage):
-        stage_name = ['preflop', 'flop', 'turn', 'river'][np.argmax(stage)]
+        stage_idx = np.argmax(stage)
         with self.lock:
-            s = self.stats[player_id][stage_name]
-            total = max(s['total'], 1)
-            return np.array([s['raises'] / total, s['folds'] / total, s['calls'] / total], dtype=np.float16)
+            idx_base = stage_idx * 4
+            total = max(self.stats[player_id][idx_base + 3], 1)
+            return np.array([
+                self.stats[player_id][idx_base + 0] / total,
+                self.stats[player_id][idx_base + 1] / total,
+                self.stats[player_id][idx_base + 2] / total
+            ], dtype=np.float16)
 
 # ========== РАСШИРЕННАЯ ОБРАБОТКА СОСТОЯНИЙ ==========
 @torch.jit.script
@@ -230,7 +229,7 @@ def fast_normalize(x: torch.Tensor) -> torch.Tensor:
     return (x - x.mean()) / (x.std() + 1e-8)
 
 class StateProcessor:
-    def __init__(self, noise_intensity=0.0):  # Шум опционален
+    def __init__(self, noise_intensity=0.0):
         self.noise_intensity = noise_intensity
         self.card_embedding = CardEmbedding().to(device)
 
@@ -441,18 +440,18 @@ def tournament(env, num):
 # ========== СЕССИЯ ОБУЧЕНИЯ ==========
 class TrainingSession:
     def __init__(self):
-        self.processor = StateProcessor(noise_intensity=0.0)  # Шум отключён по умолчанию
+        self.processor = StateProcessor(noise_intensity=0.0)
         self.opponent_stats = SharedOpponentStats()
         self.model = None
         self.target_model = None
         self.optimizer = None
-        self.scaler = GradScaler()
+        self.scaler = torch.amp.GradScaler('cuda')
 
     def initialize_models(self, input_size, num_actions):
         self.model = DuelingPokerNN(input_size, num_actions).to(device)
         self.target_model = DuelingPokerNN(input_size, num_actions).to(device)
         self.target_model.load_state_dict(self.model.state_dict())
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)  # AdamW вместо Adam
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
 
     def train_epoch(self, buffer, episode):
         batch, indices, weights = buffer.sample(batch_size)
@@ -498,7 +497,7 @@ class TrainingSession:
             'target_model': self.target_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scaler': self.scaler.state_dict(),
-            'stats': dict(self.opponent_stats.stats),
+            'stats': [list(arr) for arr in self.opponent_stats.stats],
             'version': code_version,
             'timestamp': time.time()
         }
@@ -514,12 +513,14 @@ class TrainingSession:
         self.target_model.load_state_dict(checkpoint['target_model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scaler.load_state_dict(checkpoint['scaler'])
-        self.opponent_stats.stats.update(checkpoint['stats'])
+        for pid, stat_list in enumerate(checkpoint['stats']):
+            for i, val in enumerate(stat_list):
+                self.opponent_stats.stats[pid][i] = val
 
     def train(self):
         envs = [rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42 + i}) for i in range(num_tables)]
         base_state_size = np.prod(envs[0].state_shape[0]) - 52 + 84
-        extra_features = 2 + 6 + 6 + 4 + (5 * 3) + 2  # Убрана история действий
+        extra_features = 2 + 6 + 6 + 4 + (5 * 3) + 2
         state_size = base_state_size + extra_features
         num_actions = envs[0].num_actions
         self.initialize_models(state_size, num_actions)
@@ -533,7 +534,7 @@ class TrainingSession:
         hand_history = HandHistory()
 
         test_env = rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42})
-        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles]  # Больше разнообразия
+        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles]
         test_env.set_agents(test_agents)
 
         tracemalloc.start()
@@ -633,6 +634,7 @@ class TrainingSession:
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
+    mp.set_start_method('spawn')  # Устанавливаем метод запуска для совместимости с CUDA
     session = TrainingSession()
     try:
         session.train()
