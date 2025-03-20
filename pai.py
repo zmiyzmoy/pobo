@@ -9,7 +9,7 @@ import random
 import collections
 import rlcard
 from tqdm.auto import tqdm
-from multiprocessing import Pool, Lock, Array
+from multiprocessing import Pool
 from rlcard.agents import RandomAgent, CFRAgent
 import time
 import logging
@@ -21,9 +21,9 @@ from torch.utils.tensorboard import SummaryWriter
 import shutil
 
 # ========== КОНФИГУРАЦИЯ ==========
-model_path = './poker_ai_pro.pt'
-best_model_path = './poker_ai_best.pt'
-log_dir = './poker_logs/'
+model_path = '/home/gunelmikayilova91/pobo/pai.pt'  # Обновлённый путь
+best_model_path = '/home/gunelmikayilova91/pobo/pai_best.pt'
+log_dir = '/home/gunelmikayilova91/pobo/logs/'
 os.makedirs(log_dir, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
                     handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
@@ -93,32 +93,35 @@ class PrioritizedExperienceBuffer:
         self.buffer = collections.deque(maxlen=capacity)
         self.priorities = collections.deque(maxlen=capacity)
         self.visit_counts = collections.deque(maxlen=capacity)
-        self.lock = Lock()
 
     def add(self, experience, priority):
-        with self.lock:
-            self.buffer.append(experience)
-            self.priorities.append(priority)
-            self.visit_counts.append(0)
+        self.buffer.append(experience)
+        self.priorities.append(priority)
+        self.visit_counts.append(0)
 
     def sample(self, batch_size, beta=0.4):
-        with self.lock:
-            priorities = np.array(self.priorities, dtype=np.float32) + 1e-5
-            visits = np.array(self.visit_counts, dtype=np.float32) + 1
-            adjusted_priorities = priorities / visits
-            probs = adjusted_priorities ** 0.6 / adjusted_priorities.sum()
-            indices = np.random.choice(len(self.buffer), batch_size, p=probs)
-            samples = [self.buffer[idx] for idx in indices]
-            for idx in indices:
-                self.visit_counts[idx] += 1
-            weights = (len(self.buffer) * probs[indices]) ** (-beta)
-            weights /= weights.max()
-            return samples, indices, torch.FloatTensor(weights).to(device)
+        priorities = np.array(self.priorities, dtype=np.float32) + 1e-5
+        visits = np.array(self.visit_counts, dtype=np.float32) + 1
+        adjusted_priorities = priorities / visits
+        probs = adjusted_priorities ** 0.6 / adjusted_priorities.sum()
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        for idx in indices:
+            self.visit_counts[idx] += 1
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        return samples, indices, torch.FloatTensor(weights).to(device)
 
     def update_priorities(self, indices, errors):
-        with self.lock:
-            for idx, error in zip(indices, errors):
-                self.priorities[idx] = abs(error) + 1e-5
+        for idx, error in zip(indices, errors):
+            self.priorities[idx] = abs(error) + 1e-5
+
+    def merge(self, other_buffer):
+        for exp, pri, vis in zip(other_buffer.buffer, other_buffer.priorities, other_buffer.visit_counts):
+            if len(self.buffer) < self.buffer.maxlen:
+                self.buffer.append(exp)
+                self.priorities.append(pri)
+                self.visit_counts.append(vis)
 
     def __len__(self):
         return len(self.buffer)
@@ -189,39 +192,40 @@ def extract_cards(state_dict, stage):
 # ========== ПОТОКОБЕЗОПАСНАЯ СТАТИСТИКА ОППОНЕНТОВ ==========
 class SharedOpponentStats:
     def __init__(self):
-        self.lock = Lock()
-        self.stats = [Array('i', [0] * 16) for _ in range(6)]
+        self.stats = [[0] * 16 for _ in range(6)]
         self._initialize()
 
     def _initialize(self):
-        with self.lock:
-            for pid in range(6):
-                for stage in range(4):
-                    for metric in range(4):
-                        self.stats[pid][stage * 4 + metric] = 0
+        for pid in range(6):
+            for stage in range(4):
+                for metric in range(4):
+                    self.stats[pid][stage * 4 + metric] = 0
 
     def update(self, player_id, action, stage, bet_size=0):
         stage_idx = np.argmax(stage)
-        with self.lock:
-            idx_base = stage_idx * 4
-            self.stats[player_id][idx_base + 3] += 1
-            if action == 0:
-                self.stats[player_id][idx_base + 1] += 1
-            elif action == 1:
-                self.stats[player_id][idx_base + 2] += 1
-            elif action > 1:
-                self.stats[player_id][idx_base + 0] += int(bet_size)
+        idx_base = stage_idx * 4
+        self.stats[player_id][idx_base + 3] += 1
+        if action == 0:
+            self.stats[player_id][idx_base + 1] += 1
+        elif action == 1:
+            self.stats[player_id][idx_base + 2] += 1
+        elif action > 1:
+            self.stats[player_id][idx_base + 0] += int(bet_size)
 
     def get_behavior(self, player_id, stage):
         stage_idx = np.argmax(stage)
-        with self.lock:
-            idx_base = stage_idx * 4
-            total = max(self.stats[player_id][idx_base + 3], 1)
-            return np.array([
-                self.stats[player_id][idx_base + 0] / total,
-                self.stats[player_id][idx_base + 1] / total,
-                self.stats[player_id][idx_base + 2] / total
-            ], dtype=np.float16)
+        idx_base = stage_idx * 4
+        total = max(self.stats[player_id][idx_base + 3], 1)
+        return np.array([
+            self.stats[player_id][idx_base + 0] / total,
+            self.stats[player_id][idx_base + 1] / total,
+            self.stats[player_id][idx_base + 2] / total
+        ], dtype=np.float16)
+
+    def merge(self, other_stats):
+        for pid in range(6):
+            for i in range(16):
+                self.stats[pid][i] += other_stats.stats[pid][i]
 
 # ========== РАСШИРЕННАЯ ОБРАБОТКА СОСТОЯНИЙ ==========
 @torch.jit.script
@@ -378,7 +382,8 @@ class CustomDQNAgent:
 
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
-    env, agents, processor, num_steps, device, table_id, hand_history, opponent_stats = args
+    env, agents, processor, num_steps, device, table_id, hand_history = args
+    local_opponent_stats = SharedOpponentStats()
     experiences = []
     state = env.reset()
     for _ in range(num_steps):
@@ -388,10 +393,10 @@ def collect_experience(args):
         bets = [env.game.players[i].in_chips if not env.game.players[i].is_out() else 0 for i in range(6)]
         stacks = [p.remain_chips for p in env.game.players]
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-        opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and not env.game.players[i].is_out()])
+        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and not env.game.players[i].is_out()])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
         next_state, reward, done, _ = env.step(action)
-        opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
+        local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
         player_cards, community_cards = extract_cards(state[player_id], stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
         total_reward = reward[player_id]
@@ -404,7 +409,7 @@ def collect_experience(args):
         state = next_state
         if done:
             state = env.reset()
-    return experiences
+    return experiences, local_opponent_stats
 
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
@@ -497,7 +502,7 @@ class TrainingSession:
             'target_model': self.target_model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scaler': self.scaler.state_dict(),
-            'stats': [list(arr) for arr in self.opponent_stats.stats],
+            'stats': self.opponent_stats.stats,
             'version': code_version,
             'timestamp': time.time()
         }
@@ -513,9 +518,7 @@ class TrainingSession:
         self.target_model.load_state_dict(checkpoint['target_model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scaler.load_state_dict(checkpoint['scaler'])
-        for pid, stat_list in enumerate(checkpoint['stats']):
-            for i, val in enumerate(stat_list):
-                self.opponent_stats.stats[pid][i] = val
+        self.opponent_stats.stats = checkpoint['stats']
 
     def train(self):
         envs = [rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42 + i}) for i in range(num_tables)]
@@ -549,15 +552,16 @@ class TrainingSession:
         for episode in range(num_episodes):
             with Pool(processes=num_workers) as pool:
                 env_args = [
-                    (envs[i % num_tables], agents_per_table[i % num_tables], self.processor, steps_per_worker, device, i % num_tables, hand_history, self.opponent_stats)
+                    (envs[i % num_tables], agents_per_table[i % num_tables], self.processor, steps_per_worker, device, i % num_tables, hand_history)
                     for i in range(num_workers)
                 ]
                 results = pool.map(collect_experience, env_args)
 
-            for exp_list in results:
+            for exp_list, local_stats in results:
                 for exp in exp_list:
                     buffer.add(exp, priority=1.0)
                     total_hands += 1
+                self.opponent_stats.merge(local_stats)
 
             if len(buffer) > batch_size:
                 loss = self.train_epoch(buffer, episode)
@@ -634,7 +638,9 @@ class TrainingSession:
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
-    mp.set_start_method('spawn')  # Устанавливаем метод запуска для совместимости с CUDA
+    mp.set_start_method('spawn')
+    processor = StateProcessor(noise_intensity=0.0)  # Глобальный процессор для всех агентов
+    opponent_stats = SharedOpponentStats()  # Глобальная статистика
     session = TrainingSession()
     try:
         session.train()
