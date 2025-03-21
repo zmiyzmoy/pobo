@@ -374,10 +374,14 @@ class CustomDQNAgent:
             self.epsilon = max(epsilon_end, self.epsilon * (0.99 if recent_rewards < 0 else 0.95))
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
+        logging.debug(f"Step input: state type={type(state)}, state={state}")
         if isinstance(state, tuple):
             state_dict = state[0]
         else:
             state_dict = state
+        if not isinstance(state_dict, dict):
+            logging.error(f"State is not a dict: type={type(state_dict)}, value={state_dict}")
+            raise ValueError(f"Invalid state format: expected dict, got {type(state_dict)}")
         legal_actions = list(state_dict['legal_actions'].keys())
         player_cards, community_cards = extract_cards(state_dict, stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
@@ -389,6 +393,20 @@ class CustomDQNAgent:
             if action > 1:
                 action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
             self.action_history.append(action)
+            logging.debug(f"Random action chosen: {action}")
+            return action
+
+        with torch.no_grad():
+            q_values = self.model(state_tensor)
+            noise = torch.normal(0, noise_scale, q_values.shape).to(device)
+            q_values += noise
+            q_values_legal = q_values[0, legal_actions]
+            action_idx = torch.argmax(q_values_legal).item()
+            action = legal_actions[action_idx]
+            if action > 1:
+                action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
+            self.action_history.append(action)
+            logging.debug(f"Q-value action chosen: {action}")
             return action
 
         with torch.no_grad():
