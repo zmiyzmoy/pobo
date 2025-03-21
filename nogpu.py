@@ -177,7 +177,7 @@ def number_to_card(card_num):
 def number_to_treys_card(card_num):
     """Convert a card number (0-51) to treys format (e.g., 'Js' for Jack of Spades)."""
     suits = {0: 'c', 1: 'd', 2: 'h', 3: 's'}
-    ranks = {0: '2', 1: '3', 2: '4', 3: '5', 4: '6', 5: '7', 6: '8', 7: '9', 8: '10', 9: 'j', 10: 'q', 11: 'k', 12: 'a'}
+    ranks = {0: '2', 1: '3', 2: '4', 3: '5', 4: '6', 5: '7', 6: '8', 7: '9', 8: 't', 9: 'j', 10: 'q', 11: 'k', 12: 'a'}
     
     if not (0 <= card_num <= 51):
         logging.error(f"Invalid card number for treys conversion: {card_num}")
@@ -463,62 +463,47 @@ class CustomDQNAgent:
         try:
             logging.debug(f"Agent step called with state: {state}")
             
-            if not isinstance(state, dict):
-                logging.error(f"State is not a dict: {type(state)}, value: {state}")
-                state = {'obs': np.zeros(82), 'legal_actions': OrderedDict({0: None, 1: None, 3: None, 4: None}), 'raw_obs': {}}
-
-            # Standardize legal_actions handling
-            legal_actions = []
-            if 'legal_actions' in state:
-                la = state['legal_actions']
-                logging.debug(f"Raw legal_actions: {la}, type: {type(la)}")
-                if isinstance(la, (dict, OrderedDict)):
-                    legal_actions = list(la.keys())
-                elif isinstance(la, (list, tuple)):
-                    legal_actions = list(la)
-                elif isinstance(la, int):
-                    legal_actions = [la]
-                else:
-                    logging.warning(f"Unexpected legal_actions type: {type(la)}, value: {la}")
-                    legal_actions = [0, 1, 3, 4]
+            # Стандартизация формата state
+            if isinstance(state, tuple):
+                obs = state[0]
+                legal_actions = state[1]
+                state_dict = {'obs': obs, 'legal_actions': legal_actions, 'raw_obs': obs}
+            elif isinstance(state, dict):
+                state_dict = state
             else:
-                logging.warning(f"No 'legal_actions' in state: {state}")
+                logging.error(f"Invalid state type: {type(state)}")
+                state_dict = {'obs': np.zeros(82), 'legal_actions': OrderedDict({0: None, 1: None, 3: None, 4: None}), 'raw_obs': {}}
+            
+            # Убедимся, что 'obs' — это список или массив
+            if 'obs' in state_dict:
+                if isinstance(state_dict['obs'], dict) and 'obs' in state_dict['obs']:
+                    state_dict['obs'] = state_dict['obs']['obs']
+                if isinstance(state_dict['obs'], np.ndarray):
+                    state_dict['obs'] = state_dict['obs'].tolist()
+
+            # Обработка legal_actions
+            legal_actions = state_dict.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
+            if isinstance(legal_actions, (dict, OrderedDict)):
+                legal_actions = list(legal_actions.keys())
+            elif not isinstance(legal_actions, list):
                 legal_actions = [0, 1, 3, 4]
-
-            if not legal_actions or not all(isinstance(a, (int, np.integer)) for a in legal_actions):
-                logging.error(f"Invalid legal_actions: {legal_actions}")
-                legal_actions = [0, 1, 3, 4]
-
-            logging.debug(f"Processed legal_actions: {legal_actions}")
-
-            # Convert state['obs'] to a list to avoid slicing issues
-            if 'obs' in state:
-                if isinstance(state['obs'], dict) and 'obs' in state['obs']:
-                    if isinstance(state['obs']['obs'], np.ndarray):
-                        state['obs']['obs'] = state['obs']['obs'].tolist()
-                        logging.debug(f"Converted state['obs']['obs'] to list: {state['obs']['obs'][:10]}")
-                elif isinstance(state['obs'], np.ndarray):
-                    state['obs'] = state['obs'].tolist()
-                    logging.debug(f"Converted state['obs'] to list: {state['obs'][:10]}")
+                logging.warning(f"Unexpected legal_actions type, defaulting to: {legal_actions}")
 
             processed_state = self.processor.process(
-                state, position, active_players, 
+                state_dict, position, active_players, 
                 bets, stacks, stage, opponent_behaviors
             )
             state_tensor = torch.FloatTensor(processed_state).to(device).unsqueeze(0)
 
             if np.random.rand() < self.epsilon:
-                # Random action: ensure it's legal
+                # Случайное действие
                 action = random.choice(legal_actions)
                 if action > 1:
-                    player_cards, community_cards = extract_cards(state, stage)
+                    player_cards, community_cards = extract_cards(state_dict, stage)
                     hand_strength = cached_evaluate(player_cards, community_cards)
-                    logging.debug(f"Random action, hand strength: {hand_strength:.4f}")
                     bet_size = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-                    logging.debug(f"Dynamic bet size calculated: {bet_size}")
                     pot = sum(bets)
                     my_stack = stacks[position]
-                    # Map bet size to a legal action
                     if bet_size >= my_stack and 4 in legal_actions:
                         action = 4  # ALL_IN
                     elif bet_size >= pot and 3 in legal_actions:
@@ -526,28 +511,21 @@ class CustomDQNAgent:
                     elif 2 in legal_actions:
                         action = 2  # RAISE_HALF_POT
                     else:
-                        # Fallback to a safe action
                         action = 1 if 1 in legal_actions else 0
-                    logging.debug(f"Mapped bet size {bet_size} to action: {action}")
             else:
                 with torch.no_grad():
                     q_values = self.model(state_tensor)
                     noise = torch.normal(0, noise_scale, q_values.shape).to(device)
                     q_values += noise
-                    logging.debug(f"Q-values: {q_values}, legal_actions: {legal_actions}")
-                    # Filter Q-values to only consider legal actions
                     legal_q = q_values[0, legal_actions]
                     action_idx = torch.argmax(legal_q).item()
                     action = legal_actions[action_idx]
                     if action > 1:
-                        player_cards, community_cards = extract_cards(state, stage)
+                        player_cards, community_cards = extract_cards(state_dict, stage)
                         hand_strength = cached_evaluate(player_cards, community_cards)
-                        logging.debug(f"Computed hand strength: {hand_strength}")
                         bet_size = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-                        logging.debug(f"Dynamic bet size calculated: {bet_size}")
                         pot = sum(bets)
                         my_stack = stacks[position]
-                        # Map bet size to a legal action
                         if bet_size >= my_stack and 4 in legal_actions:
                             action = 4  # ALL_IN
                         elif bet_size >= pot and 3 in legal_actions:
@@ -555,9 +533,7 @@ class CustomDQNAgent:
                         elif 2 in legal_actions:
                             action = 2  # RAISE_HALF_POT
                         else:
-                            # Fallback to a safe action
                             action = 1 if 1 in legal_actions else 0
-                        logging.debug(f"Mapped bet size {bet_size} to action: {action}")
 
             self.action_history.append(action)
             logging.debug(f"Agent chose action: {action}")
@@ -890,7 +866,7 @@ class TrainingSession:
         self.optimizer.step()
         self.scheduler.step(loss)
 
-        td_errors = (current_q.squeeze() - target_q).abs().cpu().numpy()
+        td_errors = (current_q.squeeze() - target_q).abs().detach().cpu().numpy()
         buffer.update_priorities(indices, td_errors)
         logging.debug(f"Episode {episode}, training loss: {loss.item():.4f}")
         return loss.item()
