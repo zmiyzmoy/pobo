@@ -483,8 +483,8 @@ def collect_experience(args):
             
             # Шаг среды
             next_state, player_id = env.step(action)
-reward = 0  # Временное значение, позже добавим расчёт награды
-done = False  # Временное значение, позже добавим проверку завершения
+            reward = 0  # Временное значение, позже добавим расчёт награды
+            done = False  # Временное значение, позже добавим проверку завершения
             
             # Преобразование next_state
             if not isinstance(next_state, list):
