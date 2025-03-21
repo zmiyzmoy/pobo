@@ -252,46 +252,49 @@ class StateProcessor:
         self.noise_intensity = noise_intensity
         self.card_embedding = CardEmbedding().to(device)
 
-    def process(self, state, position, active_players, bets, stacks, stage, opponent_behaviors, action=None):
-        if isinstance(state, tuple):
-            state_dict = state[0]
-        else:
-            state_dict = state
-        if 'obs' not in state_dict:
-            raise ValueError("State dict missing 'obs' key")
-        stage_array = np.array(stage)
-        obs = torch.FloatTensor(state_dict['obs'][52:] if stage_array[1:].any() else state_dict['obs'][52:]).to(device)
-        if self.noise_intensity > 0:
-            noise = torch.normal(0, self.noise_intensity, obs.shape).to(device)
-            logging.debug(f"Added noise with mean: {noise.mean():.4f}, std: {noise.std():.4f}")
-            obs += noise
-        player_cards, community_cards = extract_cards(state_dict, stage)
-        cards_input = player_cards + community_cards
-        card_emb = self.card_embedding(cards_input).flatten() if cards_input else torch.zeros(84).to(device)
-        pot = sum(bets)
-        my_bet = bets[position]
-        spr = stacks[position] / pot if pot > 0 else 10.0
-        m_factor = stacks[position] / (pot / active_players) if active_players > 0 else 10.0
-        pot_odds = my_bet / (pot + my_bet) if pot + my_bet > 0 else 0.0
-        fold_equity = np.mean([b[1] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
-        pos_feature = position / (num_players - 1)
-        table_agg = np.mean([b[0] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
-        table_fold = np.mean([b[1] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
-        bets_feature = torch.FloatTensor(bets).to(device) / 1000.0
-        stacks_feature = torch.FloatTensor(stacks).to(device) / 1000.0
-        stage_feature = torch.FloatTensor(stage).to(device)
-        opponent_features = torch.FloatTensor(opponent_behaviors).flatten() if opponent_behaviors.size else torch.zeros((num_players - 1) * 3).to(device)
-        processed = torch.cat([
-            obs,
-            card_emb,
-            torch.tensor([pos_feature, active_players / num_players, spr, m_factor, pot_odds, fold_equity], device=device),
-            bets_feature,
-            stacks_feature,
-            stage_feature,
-            opponent_features,
-            torch.tensor([table_agg, table_fold], device=device)
-        ])
-        return fast_normalize(processed).cpu().numpy()
+def process(self, state, position, active_players, bets, stacks, stage, opponent_behaviors, action=None):
+    if isinstance(state, tuple):
+        state_dict = state[0]
+    else:
+        state_dict = state
+    if 'obs' not in state_dict:
+        raise ValueError("State dict missing 'obs' key")
+    stage_array = np.array(stage)
+    # Извлекаем obs как отдельный массив
+    obs_array = state_dict['obs']
+    obs = torch.FloatTensor(obs_array[52:] if stage_array[1:].any() else obs_array[52:]).to(device)
+    if self.noise_intensity > 0:
+        noise = torch.normal(0, self.noise_intensity, obs.shape).to(device)
+        logging.debug(f"Added noise with mean: {noise.mean():.4f}, std: {noise.std():.4f}")
+        obs += noise
+    # Передаём в extract_cards весь state_dict
+    player_cards, community_cards = extract_cards(state_dict, stage)
+    cards_input = player_cards + community_cards
+    card_emb = self.card_embedding(cards_input).flatten() if cards_input else torch.zeros(84).to(device)
+    pot = sum(bets)
+    my_bet = bets[position]
+    spr = stacks[position] / pot if pot > 0 else 10.0
+    m_factor = stacks[position] / (pot / active_players) if active_players > 0 else 10.0
+    pot_odds = my_bet / (pot + my_bet) if pot + my_bet > 0 else 0.0
+    fold_equity = np.mean([b[1] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
+    pos_feature = position / (num_players - 1)
+    table_agg = np.mean([b[0] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
+    table_fold = np.mean([b[1] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
+    bets_feature = torch.FloatTensor(bets).to(device) / 1000.0
+    stacks_feature = torch.FloatTensor(stacks).to(device) / 1000.0
+    stage_feature = torch.FloatTensor(stage).to(device)
+    opponent_features = torch.FloatTensor(opponent_behaviors).flatten() if opponent_behaviors.size else torch.zeros((num_players - 1) * 3).to(device)
+    processed = torch.cat([
+        obs,
+        card_emb,
+        torch.tensor([pos_feature, active_players / num_players, spr, m_factor, pot_odds, fold_equity], device=device),
+        bets_feature,
+        stacks_feature,
+        stage_feature,
+        opponent_features,
+        torch.tensor([table_agg, table_fold], device=device)
+    ])
+    return fast_normalize(processed).cpu().numpy()
 
 # ========== HAND HISTORY ==========
 class HandHistory:
