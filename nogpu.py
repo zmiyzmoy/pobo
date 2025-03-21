@@ -17,6 +17,9 @@ from treys import Evaluator, Card
 from functools import lru_cache
 from threading import Lock
 
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s',
+                    handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
+
 # ========== КОНФИГУРАЦИЯ ==========
 model_path = '/home/gunelmikayilova91/rlcard/pai.pt'
 best_model_path = '/home/gunelmikayilova91/rlcard/pai_best.pt'
@@ -406,7 +409,7 @@ def collect_experience(args):
     
     if not isinstance(state, list):
         if not state_warning_logged:
-            logging.warning(f"State is not a list, assuming single-player state format: {type(state)}")
+            logging.warning(f"Initial state is not a list, assuming single-player state format: {type(state)}")
             state_warning_logged = True
         if isinstance(state, tuple):
             state_dict = {'obs': state[0], 'legal_actions': state[1]}
@@ -428,10 +431,10 @@ def collect_experience(args):
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
+        logging.debug(f"Before env.step: action={action}, state type={type(state[player_id])}, state={state[player_id]}")
         next_state, reward, done, info = env.step(action)
         
-        # Отладочный вывод
-        logging.debug(f"Step {step_idx}: action={action}, next_state type={type(next_state)}, reward={reward}, done={done}, info={info}")
+        logging.debug(f"Step {step_idx}: action={action}, next_state type={type(next_state)}, next_state={next_state}, reward={reward}, done={done}, info={info}")
         
         if not isinstance(next_state, list):
             if isinstance(next_state, tuple):
@@ -461,7 +464,6 @@ def collect_experience(args):
                 else:
                     state = [state] * env.num_players
     return experiences, local_opponent_stats
-
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
     total_reward = 0
