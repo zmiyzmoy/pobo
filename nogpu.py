@@ -25,7 +25,7 @@ model_path = '/home/gunelmikayilova91/rlcard/pai.pt'
 best_model_path = '/home/gunelmikayilova91/rlcard/pai_best.pt'
 log_dir = '/home/gunelmikayilova91/rlcard/logs/'
 os.makedirs(log_dir, exist_ok=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s',
                     handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
 writer = SummaryWriter(log_dir=log_dir)
 
@@ -37,7 +37,7 @@ epsilon_end = 0.01
 target_update_freq = 1000
 buffer_capacity = 500_000
 num_workers = 4  # Уменьшено для CPU
-steps_per_worker = 1000
+steps_per_worker = 1000  # Увеличено с 100 до 1000, так как это помогло избежать зависания
 selfplay_update_freq = 5000
 log_freq = 25
 test_interval = 2000
@@ -140,27 +140,69 @@ class PrioritizedExperienceBuffer:
 @lru_cache(maxsize=500)
 def cached_evaluate(player_cards, community_cards):
     evaluator = Evaluator()
-    if not community_cards or len(player_cards) < 2:
+    if not player_cards or len(player_cards) < 2:
+        logging.warning(f"Invalid player cards for evaluation: {player_cards}")
         return 0.1
+    if not isinstance(community_cards, tuple):
+        logging.warning(f"Invalid community cards for evaluation: {community_cards}")
+        community_cards = tuple()
+    
     try:
-        score = evaluator.evaluate(community_cards, player_cards)
-        return 1.0 - (score / 7462)
-    except:
+        score = evaluator.evaluate(list(community_cards), list(player_cards))
+        normalized_score = 1.0 - (score / 7462.0)  # Нормализация: 0 (худшая рука) до 1 (лучшая рука)
+        return normalized_score
+    except Exception as e:
+        logging.error(f"Error in cached_evaluate: {str(e)}")
         return 0.5
 
 def extract_cards(state_dict, stage):
     try:
         if 'raw_obs' not in state_dict:
+            logging.warning("No 'raw_obs' in state_dict")
             return (), ()
             
         raw_obs = state_dict['raw_obs']
-        player_cards = [Card.new(card) for card in raw_obs.get('hand', [])]
+        player_cards = raw_obs.get('hand', [])
+        community_cards = raw_obs.get('public_cards', [])
         
-        community_cards = []
-        if 'public_cards' in raw_obs:
-            community_cards = [Card.new(card) for card in raw_obs['public_cards']]
-            
-        return tuple(player_cards), tuple(community_cards)
+        # Проверяем, что карты в правильном формате
+        if not player_cards:
+            logging.warning("No player cards found in state")
+            return (), ()
+        if not isinstance(community_cards, list):
+            logging.warning(f"Community cards is not a list: {community_cards}")
+            community_cards = []
+
+        # Логируем сырые карты
+        logging.debug(f"Raw player_cards: {player_cards}, raw community_cards: {community_cards}")
+
+        # Преобразуем карты из строкового формата в числовой (для treys)
+        player_cards_converted = []
+        for card in player_cards:
+            if not isinstance(card, str) or len(card) < 2:
+                logging.error(f"Invalid card format in player_cards: {card}")
+                continue
+            try:
+                card_int = Card.new(card)  # Преобразуем в формат treys
+                player_cards_converted.append(card_int)
+            except Exception as e:
+                logging.error(f"Failed to convert player card {card}: {str(e)}")
+                continue
+
+        community_cards_converted = []
+        for card in community_cards:
+            if not isinstance(card, str) or len(card) < 2:
+                logging.error(f"Invalid card format in community_cards: {card}")
+                continue
+            try:
+                card_int = Card.new(card)  # Преобразуем в формат treys
+                community_cards_converted.append(card_int)
+            except Exception as e:
+                logging.error(f"Failed to convert community card {card}: {str(e)}")
+                continue
+
+        logging.debug(f"Converted player_cards: {player_cards_converted}, converted community_cards: {community_cards_converted}")
+        return tuple(player_cards_converted), tuple(community_cards_converted)
     except Exception as e:
         logging.error(f"Error in extract_cards: {str(e)}")
         return (), ()
@@ -352,6 +394,8 @@ class CustomDQNAgent:
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         try:
+            logging.debug(f"Agent step called with state: {state}")
+            
             # Проверяем, что state — это словарь
             if not isinstance(state, dict):
                 logging.error(f"State is not a dict: {type(state)}, value: {state}")
@@ -361,7 +405,8 @@ class CustomDQNAgent:
             legal_actions = []
             if 'legal_actions' in state:
                 la = state['legal_actions']
-                if isinstance(la, dict) or isinstance(la, OrderedDict):
+                logging.debug(f"Raw legal_actions: {la}, type: {type(la)}")
+                if isinstance(la, (dict, OrderedDict)):
                     legal_actions = list(la.keys())
                 elif isinstance(la, (list, tuple)):
                     legal_actions = list(la)
@@ -378,6 +423,8 @@ class CustomDQNAgent:
             if not legal_actions or not all(isinstance(a, (int, np.integer)) for a in legal_actions):
                 logging.error(f"Invalid legal_actions: {legal_actions}")
                 legal_actions = [0, 1, 3, 4]
+
+            logging.debug(f"Processed legal_actions: {legal_actions}")
 
             processed_state = self.processor.process(
                 state, position, active_players, 
@@ -396,8 +443,7 @@ class CustomDQNAgent:
                     q_values = self.model(state_tensor)
                     noise = torch.normal(0, noise_scale, q_values.shape).to(device)
                     q_values += noise
-                    # Дополнительная проверка перед индексацией
-                    logging.debug(f"legal_actions before indexing: {legal_actions}")
+                    logging.debug(f"Q-values: {q_values}, legal_actions before indexing: {legal_actions}")
                     legal_q = q_values[0, legal_actions]
                     action_idx = torch.argmax(legal_q).item()
                     action = legal_actions[action_idx]
@@ -407,6 +453,7 @@ class CustomDQNAgent:
                         action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
 
             self.action_history.append(action)
+            logging.debug(f"Agent chose action: {action}")
             return action
         except Exception as e:
             logging.error(f"Agent step failed: {str(e)}")
@@ -422,7 +469,9 @@ def collect_experience(args):
     experiences = []
     
     try:
+        logging.info(f"Starting collect_experience for table {table_id} with {num_steps} steps")
         state = env.reset()
+        logging.debug(f"Initial state after env.reset(): {state}")
         
         # Проверяем, что state корректный
         if not isinstance(state, list):
@@ -445,10 +494,12 @@ def collect_experience(args):
                 }
                 state = [state_dict] * env.num_players
             elif isinstance(state, dict):
-                # Если state — это словарь, преобразуем его в список словарей
                 legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                 if isinstance(legal_actions_dict, list):
                     legal_actions_dict = OrderedDict((a, None) for a in legal_actions_dict)
+                elif not isinstance(legal_actions_dict, (dict, OrderedDict)):
+                    logging.warning(f"Unexpected legal_actions_dict type in initial state: {type(legal_actions_dict)}, value: {legal_actions_dict}")
+                    legal_actions_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
                 state_dict = {
                     'obs': state.get('obs', np.zeros(82)),
                     'legal_actions': legal_actions_dict,
@@ -459,6 +510,8 @@ def collect_experience(args):
                 logging.error(f"Invalid initial state type: {type(state)}, value: {state}")
                 result_queue.put(([], local_opponent_stats))
                 return
+
+        logging.debug(f"Processed initial state: {state}")
 
         for step_idx in range(num_steps):
             player_id = env.timestep % env.num_players
@@ -483,7 +536,7 @@ def collect_experience(args):
             ])
             
             # Логируем state перед вызовом step
-            logging.debug(f"State before step for player {player_id}: {state[player_id]}")
+            logging.debug(f"Step {step_idx + 1}/{num_steps}, player {player_id}, state: {state[player_id]}")
             
             action = agents[player_id].step(
                 state[player_id], 
@@ -494,13 +547,14 @@ def collect_experience(args):
                 stage,
                 opponent_behaviors
             )
+            logging.debug(f"Agent {player_id} chose action: {action}")
             
             next_state, player_id = env.step(action)
             reward = 0  # Временное значение
             done = False  # Временное значение
             
             # Логируем next_state после env.step
-            logging.debug(f"Next state after step: {next_state}")
+            logging.debug(f"Next state after env.step(action={action}): {next_state}")
             
             # Проверяем, что next_state корректный
             if not isinstance(next_state, list):
@@ -522,10 +576,12 @@ def collect_experience(args):
                         'raw_obs': next_obs
                     }] * env.num_players
                 elif isinstance(next_state, dict):
-                    # Если next_state — это словарь, преобразуем его в список словарей
                     next_legal_dict = next_state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                     if isinstance(next_legal_dict, list):
                         next_legal_dict = OrderedDict((a, None) for a in next_legal_dict)
+                    elif not isinstance(next_legal_dict, (dict, OrderedDict)):
+                        logging.warning(f"Unexpected next_legal_dict type: {type(next_legal_dict)}, value: {next_legal_dict}")
+                        next_legal_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
                     next_state = [{
                         'obs': next_state.get('obs', np.zeros(82)),
                         'legal_actions': next_legal_dict,
@@ -535,10 +591,19 @@ def collect_experience(args):
                     logging.error(f"Invalid next_state type: {type(next_state)}, value: {next_state}")
                     next_state = [state[player_id]] * env.num_players  # Используем старое состояние как запасной вариант
             
+            logging.debug(f"Processed next_state: {next_state}")
+
             total_reward = reward
             local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
+            
+            # Логируем перед вызовом extract_cards
+            logging.debug(f"Calling extract_cards with state: {state[player_id]}, stage: {stage}")
             player_cards, community_cards = extract_cards(state[player_id], stage)
+            logging.debug(f"extract_cards returned player_cards: {player_cards}, community_cards: {community_cards}")
+            
             hand_strength = cached_evaluate(player_cards, community_cards)
+            logging.debug(f"Hand strength: {hand_strength}")
+            
             hand_history.add(table_id, player_id, action, action if action > 1 else 0, hand_strength, stage, sum(bets))
             agents[player_id].adaptive_epsilon_decay(total_reward)
             
@@ -559,6 +624,7 @@ def collect_experience(args):
             state = next_state
             
             if done:
+                logging.debug(f"Episode done, resetting env")
                 state = env.reset()
                 if not isinstance(state, list):
                     if isinstance(state, tuple):
@@ -583,6 +649,9 @@ def collect_experience(args):
                         legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                         if isinstance(legal_actions_dict, list):
                             legal_actions_dict = OrderedDict((a, None) for a in legal_actions_dict)
+                        elif not isinstance(legal_actions_dict, (dict, OrderedDict)):
+                            logging.warning(f"Unexpected legal_actions_dict type after reset: {type(legal_actions_dict)}, value: {legal_actions_dict}")
+                            legal_actions_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
                         state_dict = {
                             'obs': state.get('obs', np.zeros(82)),
                             'legal_actions': legal_actions_dict,
@@ -593,10 +662,12 @@ def collect_experience(args):
                         logging.error(f"Invalid reset state type: {type(state)}, value: {state}")
                         state = [state[player_id]] * env.num_players
 
+        logging.info(f"Finished collect_experience for table {table_id}, collected {len(experiences)} experiences")
         result_queue.put((experiences, local_opponent_stats))
     except Exception as e:
         logging.error(f"Experience collection crashed: {str(e)}")
         result_queue.put(([], local_opponent_stats))
+
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
     total_reward = 0
