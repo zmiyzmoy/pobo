@@ -386,14 +386,23 @@ def collect_experience(args):
     local_opponent_stats = SharedOpponentStats()
     experiences = []
     state = env.reset()
+    
+    if not isinstance(state, list) or len(state) != env.num_players:
+        logging.error(f"Invalid state length: expected {env.num_players}, got {len(state) if isinstance(state, list) else 'not a list'}")
+        return [], local_opponent_stats
+    
+    num_players = len(env.game.players)
+    if num_players != 6:
+        logging.warning(f"Expected 6 players, got {num_players}. Adjusting logic.")
+    
     for _ in range(num_steps):
         player_id = env.timestep % len(agents)
         position = env.game.get_player_id()
         active_players = len([p for p in env.game.players if p.status != 'folded'])
-        bets = [env.game.players[i].in_chips if env.game.players[i].status != 'folded' else 0 for i in range(6)]
-        stacks = [p.remain_chips for p in env.game.players]
+        bets = [env.game.players[i].in_chips if i < num_players and env.game.players[i].status != 'folded' else 0 for i in range(6)]
+        stacks = [p.remain_chips for p in env.game.players] + [0] * (6 - num_players)
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and env.game.players[i].status != 'folded'])
+        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
         next_state, reward, done, _ = env.step(action)
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
@@ -409,6 +418,9 @@ def collect_experience(args):
         state = next_state
         if done:
             state = env.reset()
+            if not isinstance(state, list) or len(state) != env.num_players:
+                logging.error(f"Invalid state length after reset: expected {env.num_players}, got {len(state) if isinstance(state, list) else 'not a list'}")
+                break
     return experiences, local_opponent_stats
 
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
@@ -416,6 +428,7 @@ def tournament(env, num):
     total_reward = 0
     action_counts = {'fold': 0, 'call': 0, 'raise': 0}
     total_actions = 0
+    num_players = len(env.game.players)
     for _ in range(num):
         state = env.reset()
         done = False
@@ -423,10 +436,10 @@ def tournament(env, num):
             player_id = env.timestep % env.num_players
             position = env.game.get_player_id()
             active_players = len([p for p in env.game.players if p.status != 'folded'])
-            bets = [env.game.players[i].in_chips if env.game.players[i].status != 'folded' else 0 for i in range(6)]
-            stacks = [p.remain_chips for p in env.game.players]
+            bets = [env.game.players[i].in_chips if i < num_players and env.game.players[i].status != 'folded' else 0 for i in range(6)]
+            stacks = [p.remain_chips for p in env.game.players] + [0] * (6 - num_players)
             stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-            opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and env.game.players[i].status != 'folded'])
+            opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
             state, reward, done, _ = env.step(action)
             if player_id == 0:
