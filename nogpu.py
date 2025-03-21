@@ -419,22 +419,26 @@ def collect_experience(args):
         logging.error(f"Player count mismatch: env.num_players={env.num_players}, actual={num_players_actual}")
         return [], local_opponent_stats
     
-    for _ in range(num_steps):
+    for step_idx in range(num_steps):
         player_id = env.timestep % len(agents)
         position = env.game.get_player_id()
         active_players = len([p for p in env.game.players if p.status == 'alive'])
         bets = [env.game.players[i].in_chips if i < num_players_actual and env.game.players[i].status == 'alive' else 0 for i in range(num_players)]
-        stacks = [p.remained_chips if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]  # Исправлено
+        stacks = [p.remained_chips if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
-        next_state, reward, done, _ = env.step(action)
+        next_state, reward, done, info = env.step(action)
+        
+        # Отладочный вывод
+        logging.debug(f"Step {step_idx}: action={action}, next_state type={type(next_state)}, reward={reward}, done={done}, info={info}")
         
         if not isinstance(next_state, list):
             if isinstance(next_state, tuple):
                 next_state_dict = {'obs': next_state[0], 'legal_actions': next_state[1]}
                 next_state = [next_state_dict] * env.num_players
             else:
+                logging.error(f"Unexpected next_state type: {type(next_state)}, value={next_state}")
                 next_state = [next_state] * env.num_players
         
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
