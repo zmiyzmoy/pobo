@@ -378,7 +378,7 @@ class CustomDQNAgent:
         if not isinstance(state, dict):
             logging.error(f"State is not a dict: type={type(state)}, value={state}")
             raise ValueError(f"Invalid state format: expected dict, got {type(state)}")
-        legal_actions = list(state['legal_actions'].keys())  # Используем state напрямую
+        legal_actions = list(state['legal_actions'].keys())
         player_cards, community_cards = extract_cards(state, stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
         processed_state = processor.process(state, position, active_players, bets, stacks, stage, opponent_behaviors)
@@ -390,32 +390,21 @@ class CustomDQNAgent:
                 action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
             self.action_history.append(action)
             logging.debug(f"Random action chosen: {action}")
-            return action
-
-        with torch.no_grad():
-            q_values = self.model(state_tensor)
-            noise = torch.normal(0, noise_scale, q_values.shape).to(device)
-            q_values += noise
-            q_values_legal = q_values[0, legal_actions]
-            action_idx = torch.argmax(q_values_legal).item()
-            action = legal_actions[action_idx]
-            if action > 1:
-                action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-            self.action_history.append(action)
-            logging.debug(f"Q-value action chosen: {action}")
-            return action
-
-        with torch.no_grad():
-            q_values = self.model(state_tensor)
-            noise = torch.normal(0, noise_scale, q_values.shape).to(device)
-            q_values += noise
-            q_values_legal = q_values[0, legal_actions]
-            action_idx = torch.argmax(q_values_legal).item()
-            action = legal_actions[action_idx]
-            if action > 1:
-                action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-            self.action_history.append(action)
-            return action
+        else:
+            with torch.no_grad():
+                q_values = self.model(state_tensor)
+                noise = torch.normal(0, noise_scale, q_values.shape).to(device)
+                q_values += noise
+                q_values_legal = q_values[0, legal_actions]
+                action_idx = torch.argmax(q_values_legal).item()
+                action = legal_actions[action_idx]
+                if action > 1:
+                    action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
+                self.action_history.append(action)
+                logging.debug(f"Q-value action chosen: {action}")
+        
+        logging.debug(f"Step output: action={action}")
+        return action
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         return self.step(state, position, active_players, bets, stacks, stage, opponent_behaviors), {}
@@ -428,13 +417,12 @@ def collect_experience(args):
     state = env.reset()
     state_warning_logged = False
     
-    # Преобразование начального состояния
     if not isinstance(state, list):
         if not state_warning_logged:
             logging.warning(f"Initial state is not a list, assuming single-player state format: {type(state)}")
             state_warning_logged = True
         if isinstance(state, tuple):
-            state_dict = {'obs': state[0], 'legal_actions': state[1]}  # state[1] — это OrderedDict
+            state_dict = {'obs': state[0], 'legal_actions': state[1]}
             state = [state_dict] * env.num_players
         else:
             logging.error(f"Unexpected initial state type: {type(state)}, value={state}")
@@ -454,18 +442,14 @@ def collect_experience(args):
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
         
-        # Проверка состояния перед шагом агента
         logging.debug(f"Before agent step: player_id={player_id}, state={state[player_id]}")
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
         
-        # Выполнение шага в окружении
         logging.debug(f"Before env.step: action={action}, state={state[player_id]}")
         next_state, reward, done, info = env.step(action)
         
-        # Проверка результата env.step
         logging.debug(f"Step {step_idx}: action={action}, next_state type={type(next_state)}, next_state={next_state}, reward={reward}, done={done}, info={info}")
         
-        # Преобразование next_state
         if not isinstance(next_state, list):
             if isinstance(next_state, tuple):
                 next_state_dict = {'obs': next_state[0], 'legal_actions': next_state[1]}
@@ -474,7 +458,6 @@ def collect_experience(args):
                 logging.error(f"Unexpected next_state type: {type(next_state)}, value={next_state}")
                 return [], local_opponent_stats
         
-        # Обновление статистики и опыта
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
         player_cards, community_cards = extract_cards(state[player_id], stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
@@ -486,10 +469,9 @@ def collect_experience(args):
             position, active_players, bets, stacks, stage, opponent_behaviors
         ))
         
-        # Обновление состояния
         state = next_state
+        logging.debug(f"After state update: state type={type(state)}, state={state}")
         
-        # Сброс при завершении эпизода
         if done:
             state = env.reset()
             if not isinstance(state, list):
