@@ -437,10 +437,11 @@ def collect_experience(args):
             logging.warning(f"Initial state is not a list, assuming single-player state format: {type(state)}")
             state_warning_logged = True
         if isinstance(state, tuple):
-            state_dict = {'obs': state[0], 'legal_actions': state[1]}
+            state_dict = {'obs': state[0], 'legal_actions': state[1]}  # Кортеж от env.reset
             state = [state_dict] * env.num_players
         else:
-            state = [state] * env.num_players
+            logging.error(f"Unexpected initial state type: {type(state)}, value={state}")
+            return [], local_opponent_stats
     
     num_players_actual = len(env.game.players)
     if num_players_actual != env.num_players:
@@ -456,7 +457,7 @@ def collect_experience(args):
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
-        logging.debug(f"Before env.step: action={action}, state type={type(state[player_id])}, state={state[player_id]}")
+        logging.debug(f"Before env.step: action={action}, state={state[player_id]}")
         next_state, reward, done, info = env.step(action)
         
         logging.debug(f"Step {step_idx}: action={action}, next_state type={type(next_state)}, next_state={next_state}, reward={reward}, done={done}, info={info}")
@@ -467,7 +468,7 @@ def collect_experience(args):
                 next_state = [next_state_dict] * env.num_players
             else:
                 logging.error(f"Unexpected next_state type: {type(next_state)}, value={next_state}")
-                next_state = [next_state] * env.num_players
+                return [], local_opponent_stats
         
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
         player_cards, community_cards = extract_cards(state[player_id], stage)
@@ -487,7 +488,8 @@ def collect_experience(args):
                     state_dict = {'obs': state[0], 'legal_actions': state[1]}
                     state = [state_dict] * env.num_players
                 else:
-                    state = [state] * env.num_players
+                    logging.error(f"Unexpected reset state type: {type(state)}, value={state}")
+                    return [], local_opponent_stats
     return experiences, local_opponent_stats
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
