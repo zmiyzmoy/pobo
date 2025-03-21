@@ -35,7 +35,7 @@ os.makedirs(log_dir, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
                     handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
 
-num_episodes = 100  # Уменьшено для отладки
+num_episodes = 10 # Уменьшено для отладки
 batch_size = 512
 gamma = 0.96
 epsilon_start = 1.0
