@@ -43,7 +43,7 @@ epsilon_end = 0.01
 target_update_freq = 1000
 buffer_capacity = 500_000
 num_workers = 4  # Уменьшено для CPU
-steps_per_worker = 5000
+s_per_worker = 5000
 selfplay_update_freq = 5000
 log_freq = 25
 test_interval = 2000
@@ -373,7 +373,7 @@ class CustomDQNAgent:
             recent_rewards = np.mean(self.reward_buffer)
             self.epsilon = max(epsilon_end, self.epsilon * (0.99 if recent_rewards < 0 else 0.95))
 
-    def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
+        def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         logging.debug(f"Step input: state type={type(state)}, state={state}")
         if not isinstance(state, dict):
             logging.error(f"State is not a dict: type={type(state)}, value={state}")
@@ -403,7 +403,7 @@ class CustomDQNAgent:
                 self.action_history.append(action)
                 logging.debug(f"Q-value action chosen: {action}")
         
-        logging.debug(f"Step output: action={action}")
+        logging.debug(f"Returning action: {action}")
         return action
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
@@ -458,6 +458,8 @@ def collect_experience(args):
                 logging.error(f"Unexpected next_state type: {type(next_state)}, value={next_state}")
                 return [], local_opponent_stats
         
+        logging.debug(f"After next_state conversion: next_state={next_state}")
+        
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
         player_cards, community_cards = extract_cards(state[player_id], stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
@@ -470,7 +472,7 @@ def collect_experience(args):
         ))
         
         state = next_state
-        logging.debug(f"After state update: state type={type(state)}, state={state}")
+        logging.debug(f"After state update: state={state}, player_id={player_id}, state[player_id]={state[player_id]}")
         
         if done:
             state = env.reset()
