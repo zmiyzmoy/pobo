@@ -421,6 +421,8 @@ class CustomDQNAgent:
             recent_avg = np.mean(self.reward_buffer)
             decay_factor = 0.98 if recent_avg < 0 else 0.95
             self.epsilon = max(epsilon_end, self.epsilon * decay_factor)
+            # Добавлено: Логируем изменение epsilon
+            logging.debug(f"Epsilon updated to {self.epsilon:.4f}, recent reward avg: {recent_avg:.4f}")
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         try:
@@ -472,7 +474,11 @@ class CustomDQNAgent:
                 if action > 1:
                     player_cards, community_cards = extract_cards(state, stage)
                     hand_strength = cached_evaluate(player_cards, community_cards)
+                    # Добавлено: Логируем силу руки
+                    logging.debug(f"Random action, hand strength: {hand_strength:.4f}")
                     action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
+                    # Добавлено: Логируем размер ставки
+                    logging.debug(f"Dynamic bet size calculated: {action}")
             else:
                 with torch.no_grad():
                     q_values = self.model(state_tensor)
@@ -485,7 +491,11 @@ class CustomDQNAgent:
                     if action > 1:
                         player_cards, community_cards = extract_cards(state, stage)
                         hand_strength = cached_evaluate(player_cards, community_cards)
+                        # Добавлено: Логируем силу руки
+                        logging.debug(f"Q-value based action, hand strength: {hand_strength:.4f}")
                         action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
+                        # Добавлено: Логируем размер ставки
+                        logging.debug(f"Dynamic bet size calculated: {action}")
 
             self.action_history.append(action)
             logging.debug(f"Agent chose action: {action}")
@@ -504,6 +514,7 @@ def collect_experience(args):
     
     try:
         logging.info(f"Starting collect_experience for table {table_id} with {num_steps} steps")
+        start_time = time.time()  # Добавлено: Логируем время начала сбора опыта
         state = env.reset()
         logging.debug(f"Initial state after env.reset(): {state}")
         
@@ -548,6 +559,8 @@ def collect_experience(args):
         logging.debug(f"Processed initial state: {state}")
 
         for step_idx in range(num_steps):
+            logging.debug(f"Step {step_idx + 1}/{num_steps} started for table {table_id}")  # Добавлено: Логируем начало каждого шага
+            step_start_time = time.time()  # Добавлено: Логируем время начала шага
             player_id = env.timestep % env.num_players
             position = env.game.get_player_id()
             active_players = len([p for p in env.game.players if p.status == 'alive'])
@@ -696,7 +709,13 @@ def collect_experience(args):
                         logging.error(f"Invalid reset state type: {type(state)}, value: {state}")
                         state = [state[player_id]] * env.num_players
 
-        logging.info(f"Finished collect_experience for table {table_id}, collected {len(experiences)} experiences")
+            # Добавлено: Логируем время выполнения шага
+            step_duration = time.time() - step_start_time
+            logging.debug(f"Step {step_idx + 1}/{num_steps} completed in {step_duration:.2f} seconds")
+
+        # Добавлено: Логируем общее время выполнения и количество собранного опыта
+        total_duration = time.time() - start_time
+        logging.info(f"Finished collect_experience for table {table_id}, collected {len(experiences)} experiences in {total_duration:.2f} seconds")
         result_queue.put((experiences, local_opponent_stats))
     except Exception as e:
         logging.error(f"Experience collection crashed: {str(e)}")
@@ -714,7 +733,11 @@ def tournament(env, num):
     else:
         num_players_actual = len(env.game.players)
     
-    for _ in range(num):
+    logging.info(f"Starting tournament with {num} episodes")  # Добавлено: Логируем начало турнира
+    start_time = time.time()  # Добавлено: Логируем время начала
+
+    for episode in range(num):
+        logging.debug(f"Tournament episode {episode + 1}/{num} started")  # Добавлено: Логируем начало эпизода
         state = env.reset()
         if not isinstance(state, list):
             if isinstance(state, tuple):
@@ -750,8 +773,13 @@ def tournament(env, num):
                 elif action > 1:
                     action_counts['raise'] += 1
                 total_actions += 1
+        logging.debug(f"Tournament episode {episode + 1}/{num} completed")  # Добавлено: Логируем завершение эпизода
+
     winrate = total_reward / num
     action_freq = {k: v / total_actions if total_actions > 0 else 0 for k, v in action_counts.items()}
+    # Добавлено: Логируем общее время выполнения турнира
+    total_duration = time.time() - start_time
+    logging.info(f"Tournament completed in {total_duration:.2f} seconds, winrate: {winrate:.2f}, action_freq: {action_freq}")
     return winrate, action_freq
 
 # ========== СЕССИЯ ОБУЧЕНИЯ ==========
@@ -770,6 +798,8 @@ class TrainingSession:
         self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=500)
+        # Добавлено: Логируем инициализацию моделей
+        logging.info(f"Models initialized with input_size={input_size}, num_actions={num_actions}")
 
     def train_epoch(self, buffer, episode):
         batch, indices, weights = buffer.sample(batch_size)
@@ -795,6 +825,8 @@ class TrainingSession:
 
         td_errors = (current_q.squeeze() - target_q).abs().cpu().numpy()
         buffer.update_priorities(indices, td_errors)
+        # Добавлено: Логируем значение потерь
+        logging.debug(f"Episode {episode}, training loss: {loss.item():.4f}")
         return loss.item()
 
     def _check_gradients(self):
@@ -821,6 +853,8 @@ class TrainingSession:
         torch.save(checkpoint, path)
         if is_best:
             shutil.copyfile(path, best_model_path)
+        # Добавлено: Логируем сохранение чекпоинта
+        logging.info(f"Checkpoint saved to {path}, is_best={is_best}")
 
     def load_checkpoint(self, path):
         checkpoint = torch.load(path)
@@ -831,6 +865,8 @@ class TrainingSession:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         self.opponent_stats.stats = checkpoint['stats']
+        # Добавлено: Логируем загрузку чекпоинта
+        logging.info(f"Checkpoint loaded from {path}")
 
     def train(self):
         envs = [rlcard.make('no-limit-holdem', config={'num_players': num_players, 'seed': 42 + i}) for i in range(num_tables)]
@@ -867,6 +903,9 @@ class TrainingSession:
         last_test_time = time.time()
 
         for episode in range(num_episodes):
+            logging.info(f"Starting episode {episode + 1}/{num_episodes}")  # Добавлено: Логируем начало эпизода
+            episode_start_time = time.time()  # Добавлено: Логируем время начала эпизода
+
             result_queues = [Queue() for _ in range(num_workers)]
             processes = []
             
@@ -877,16 +916,27 @@ class TrainingSession:
                     target=collect_experience,
                     args=((env, agents, self.processor, steps_per_worker, device, i % num_tables, hand_history, result_queues[i]),)
                 )
+                logging.debug(f"Starting process {i} for table {i % num_tables}")  # Добавлено: Логируем запуск процесса
                 p.start()
                 processes.append(p)
             
             results = []
-            for q in result_queues:
-                result = q.get()
-                results.append(result)
+            for idx, q in enumerate(result_queues):
+                try:
+                    # Добавлено: Используем тайм-аут для Queue.get()
+                    result = q.get(timeout=60)  # Тайм-аут 60 секунд
+                    results.append(result)
+                    logging.debug(f"Received result from queue {idx}, experiences: {len(result[0])}")  # Добавлено: Логируем получение результата
+                except Queue.Empty:
+                    logging.error(f"Queue.get() timed out after 60 seconds for queue {idx}, process likely hung")
+                    for p in processes:
+                        p.terminate()  # Завершаем зависшие процессы
+                        logging.debug(f"Terminated process {p.pid}")  # Добавлено: Логируем завершение процесса
+                    raise RuntimeError(f"Experience collection process hung for queue {idx}")
             
             for p in processes:
                 p.join()
+                logging.debug(f"Process {p.pid} joined")  # Добавлено: Логируем завершение процесса
 
             for exp_list, local_stats in results:
                 for exp in exp_list:
@@ -894,6 +944,8 @@ class TrainingSession:
                     buffer.add(exp, priority=1.0)
                     total_hands += 1
                 self.opponent_stats.merge(local_stats)
+                # Добавлено: Логируем количество добавленного опыта
+                logging.debug(f"Added {len(exp_list)} experiences to buffer, total hands: {total_hands}")
 
             if len(buffer) > batch_size:
                 loss = self.train_epoch(buffer, episode)
@@ -901,11 +953,15 @@ class TrainingSession:
 
             if episode % target_update_freq == 0:
                 self.target_model.load_state_dict(self.model.state_dict())
+                # Добавлено: Логируем обновление целевой модели
+                logging.info(f"Target model updated at episode {episode}")
 
             if episode % selfplay_update_freq == 0:
                 for table_agents in agents_per_table:
                     for agent in table_agents:
                         agent.model.load_state_dict(self.model.state_dict())
+                # Добавлено: Логируем обновление моделей агентов
+                logging.info(f"Agent models updated for self-play at episode {episode}")
 
             if episode % log_freq == 0 and len(losses) > 0:
                 avg_loss = np.mean(losses)
@@ -947,6 +1003,10 @@ class TrainingSession:
             if total_hands >= 10_000:
                 logging.info(f"Достигнуто 10,000 раздач на эпизоде {episode}")
                 break
+
+            # Добавлено: Логируем время выполнения эпизода
+            episode_duration = time.time() - episode_start_time
+            logging.info(f"Episode {episode + 1}/{num_episodes} completed in {episode_duration:.2f} seconds")
 
             pbar.update(1)
 
