@@ -36,7 +36,7 @@ epsilon_end = 0.01
 target_update_freq = 1000
 buffer_capacity = 500_000
 num_workers = 4  # Уменьшено для CPU
-steps_per_worker = 5000
+steps_per_worker = 1000
 selfplay_update_freq = 5000
 log_freq = 25
 test_interval = 2000
@@ -358,11 +358,22 @@ class CustomDQNAgent:
                     if isinstance(la, dict):
                         legal_actions = list(la.keys())
                     elif isinstance(la, (list, tuple)):
-                        legal_actions = la
+                        legal_actions = list(la)
                     elif isinstance(la, int):
                         legal_actions = [la]
-                
+                    else:
+                        logging.warning(f"Unexpected legal_actions type: {type(la)}, value: {la}")
+                        legal_actions = [0, 1, 3, 4]
+            else:
+                logging.warning(f"State is not a dict: {type(state)}, value: {state}")
+            
             if not legal_actions:
+                logging.info("No legal actions found, using default: [0, 1, 3, 4]")
+                legal_actions = [0, 1, 3, 4]
+
+            # Проверяем, что legal_actions содержит только целые числа
+            if not all(isinstance(a, (int, np.integer)) for a in legal_actions):
+                logging.error(f"Invalid legal_actions: {legal_actions}")
                 legal_actions = [0, 1, 3, 4]
 
             processed_state = self.processor.process(
