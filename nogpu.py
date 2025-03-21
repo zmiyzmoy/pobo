@@ -1,13 +1,3 @@
-from multiprocessing import Process, Queue
-import os
-import logging
-
-# Конфигурация логирования
-log_dir = '/home/gunelmikayilova91/rlcard/logs/'
-os.makedirs(log_dir, exist_ok=True)
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s',
-                    handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,19 +6,18 @@ import numpy as np
 import os
 import random
 import collections
-from collections import OrderedDict  # Добавляем импорт OrderedDict
+from collections import OrderedDict
 import rlcard
 from tqdm.auto import tqdm
-from multiprocessing import Pool
-from multiprocessing import Manager
+from multiprocessing import Process, Queue
 from rlcard.agents import RandomAgent
 import time
 import logging
 import math
 from treys import Evaluator, Card
 from functools import lru_cache
-# from threading import Lock
-
+from torch.utils.tensorboard import SummaryWriter
+import shutil
 
 # ========== КОНФИГУРАЦИЯ ==========
 model_path = '/home/gunelmikayilova91/rlcard/pai.pt'
@@ -37,8 +26,9 @@ log_dir = '/home/gunelmikayilova91/rlcard/logs/'
 os.makedirs(log_dir, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
                     handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
+writer = SummaryWriter(log_dir=log_dir)
 
-num_episodes = 10 # Уменьшено для отладки
+num_episodes = 10  # Уменьшено для отладки
 batch_size = 512
 gamma = 0.96
 epsilon_start = 1.0
@@ -46,7 +36,7 @@ epsilon_end = 0.01
 target_update_freq = 1000
 buffer_capacity = 500_000
 num_workers = 4  # Уменьшено для CPU
-s_per_worker = 5000
+steps_per_worker = 5000
 selfplay_update_freq = 5000
 log_freq = 25
 test_interval = 2000
@@ -206,8 +196,7 @@ class CardEmbedding(nn.Module):
 # ========== ПОТОКОБЕЗОПАСНАЯ СТАТИСТИКА ОППОНЕНТОВ ==========
 class SharedOpponentStats:
     def __init__(self):
-        self.manager = Manager()
-        self.stats = self.manager.list([self.manager.list([0] * 16) for _ in range(num_players)])
+        self.stats = [[0] * 16 for _ in range(num_players)]
         self._initialize()
 
     def _initialize(self):
@@ -322,14 +311,14 @@ class HandHistory:
 
 # ========== АГЕНТ ==========
 class CustomDQNAgent:
-    def __init__(self, model, style='default'):
+    def __init__(self, model, processor, style='default'):
         self.model = model
+        self.processor = processor
         self.epsilon = epsilon_start
         self.style = style
         self.total_updates = 0
         self.reward_buffer = collections.deque(maxlen=100)
         self.action_history = collections.deque(maxlen=5)
-        self.processor = StateProcessor(noise_intensity=0.0)
 
     def dynamic_bet_size(self, stacks, bets, position, opponent_behaviors, hand_strength, stage):
         try:
@@ -362,7 +351,6 @@ class CustomDQNAgent:
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         try:
-            # Обработка legal_actions
             legal_actions = []
             if isinstance(state, dict):
                 if 'legal_actions' in state:
@@ -377,14 +365,12 @@ class CustomDQNAgent:
             if not legal_actions:
                 legal_actions = [0, 1, 3, 4]
 
-            # Обработка состояния
             processed_state = self.processor.process(
                 state, position, active_players, 
                 bets, stacks, stage, opponent_behaviors
             )
             state_tensor = torch.FloatTensor(processed_state).to(device).unsqueeze(0)
 
-            # Выбор действия
             if np.random.rand() < self.epsilon:
                 action = random.choice(legal_actions)
                 if action > 1:
@@ -412,7 +398,6 @@ class CustomDQNAgent:
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         return self.step(state, position, active_players, bets, stacks, stage, opponent_behaviors), {}
-
 
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
@@ -501,10 +486,17 @@ def collect_experience(args):
                         'raw_obs': next_obs
                     }] * env.num_players
             
+            total_reward = reward
+            local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
+            player_cards, community_cards = extract_cards(state[player_id], stage)
+            hand_strength = cached_evaluate(player_cards, community_cards)
+            hand_history.add(table_id, player_id, action, action if action > 1 else 0, hand_strength, stage, sum(bets))
+            agents[player_id].adaptive_epsilon_decay(total_reward)
+            
             experiences.append((
                 state[player_id],
                 action,
-                reward,
+                total_reward,
                 next_state[player_id],
                 done,
                 position,
@@ -519,72 +511,29 @@ def collect_experience(args):
             
             if done:
                 state = env.reset()
+                if not isinstance(state, list):
+                    if isinstance(state, tuple):
+                        obs_part = state[0]
+                        legal_actions_part = state[1]
+                        
+                        if isinstance(legal_actions_part, int):
+                            legal_actions_dict = OrderedDict({legal_actions_part: None})
+                        elif isinstance(legal_actions_part, (list, tuple)):
+                            legal_actions_dict = OrderedDict((a, None) for a in legal_actions_part)
+                        else:
+                            legal_actions_dict = legal_actions_part
+                            
+                        state_dict = {
+                            'obs': obs_part,
+                            'legal_actions': legal_actions_dict,
+                            'raw_obs': obs_part
+                        }
+                        state = [state_dict] * env.num_players
 
         result_queue.put((experiences, local_opponent_stats))
     except Exception as e:
         logging.error(f"Experience collection crashed: {str(e)}")
         result_queue.put(([], local_opponent_stats))
-      
-            
-            # Выбор действия
-            action = agents[player_id].step(
-                state[player_id], 
-                position, 
-                active_players,
-                bets,
-                stacks,
-                stage,
-                opponent_behaviors
-            )
-            
-            # Шаг среды
-            next_state, player_id = env.step(action)
-            reward = 0  # Временное значение, позже добавим расчёт награды
-            done = False  # Временное значение, позже добавим проверку завершения
-            
-            # Преобразование next_state
-            if not isinstance(next_state, list):
-                if isinstance(next_state, tuple):
-                    next_obs = next_state[0]
-                    next_legal = next_state[1]
-                    
-                    if isinstance(next_legal, int):
-                        next_legal_dict = OrderedDict({next_legal: None})
-                    elif isinstance(next_legal, (list, tuple)):
-                        next_legal_dict = OrderedDict((a, None) for a in next_legal)
-                    else:
-                        next_legal_dict = next_legal
-                        
-                    next_state = [{
-                        'obs': next_obs,
-                        'legal_actions': next_legal_dict,
-                        'raw_obs': next_obs
-                    }] * env.num_players
-            
-            # Сохранение опыта
-            experiences.append((
-                state[player_id],
-                action,
-                reward[player_id] if isinstance(reward, list) else reward,
-                next_state[player_id],
-                done,
-                position,
-                active_players,
-                bets,
-                stacks,
-                stage,
-                opponent_behaviors
-            ))
-            
-            state = next_state
-            
-            if done:
-                state = env.reset()
-
-        return experiences, local_opponent_stats
-    except Exception as e:
-        logging.error(f"Experience collection crashed: {str(e)}")
-        return [], local_opponent_stats
 
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
@@ -596,7 +545,7 @@ def tournament(env, num):
         state = env.reset()
         if not isinstance(state, list):
             if isinstance(state, tuple):
-                state_dict = {'obs': state[0], 'legal_actions': state[1]}
+                state_dict = {'obs': state[0], 'legal_actions': state[1], 'raw_obs': state[0]}
                 state = [state_dict] * env.num_players
             else:
                 state = [state] * env.num_players
@@ -606,19 +555,21 @@ def tournament(env, num):
             position = env.game.get_player_id()
             active_players = len([p for p in env.game.players if p.status == 'alive'])
             bets = [env.game.players[i].in_chips if i < num_players_actual and env.game.players[i].status == 'alive' else 0 for i in range(num_players)]
-            stacks = [p.remained_chips if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]  # Исправлено
+            stacks = [env.game.players[i].remained_chips if i < num_players_actual else 0 for i in range(num_players)]
             stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
             opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
-            state, reward, done, _ = env.step(action)
+            state, player_id = env.step(action)
+            reward = 0  # Временное значение
+            done = False  # Временное значение
             if not isinstance(state, list):
                 if isinstance(state, tuple):
-                    state_dict = {'obs': state[0], 'legal_actions': state[1]}
+                    state_dict = {'obs': state[0], 'legal_actions': state[1], 'raw_obs': state[0]}
                     state = [state_dict] * env.num_players
                 else:
                     state = [state] * env.num_players
             if player_id == 0:
-                total_reward += reward[player_id] if isinstance(reward, list) else reward
+                total_reward += reward
                 if action == 0:
                     action_counts['fold'] += 1
                 elif action == 1:
@@ -629,6 +580,7 @@ def tournament(env, num):
     winrate = total_reward / num
     action_freq = {k: v / total_actions if total_actions > 0 else 0 for k, v in action_counts.items()}
     return winrate, action_freq
+
 # ========== СЕССИЯ ОБУЧЕНИЯ ==========
 class TrainingSession:
     def __init__(self):
@@ -721,7 +673,7 @@ class TrainingSession:
         self.initialize_models(state_size, num_actions)
 
         agent_styles = ['tight', 'loose', 'aggressive', 'bluffer', 'default', 'passive']
-        agents_per_table = [[CustomDQNAgent(self.model, s) for s in agent_styles[:min(num_players, envs[i].num_players)]] for i in range(num_tables)]
+        agents_per_table = [[CustomDQNAgent(self.model, self.processor, s) for s in agent_styles[:min(num_players, envs[i].num_players)]] for i in range(num_tables)]
         for env, agents in zip(envs, agents_per_table):
             env.set_agents(agents)
 
@@ -729,7 +681,7 @@ class TrainingSession:
         hand_history = HandHistory()
 
         test_env = rlcard.make('no-limit-holdem', config={'num_players': num_players, 'seed': 42})
-        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles[:min(num_players, test_env.num_players)]]
+        test_agents = [CustomDQNAgent(self.model, self.processor, s) for s in agent_styles[:min(num_players, test_env.num_players)]]
         test_env.set_agents(test_agents)
 
         pbar = tqdm(total=num_episodes, desc="Обучение", dynamic_ncols=True)
@@ -741,12 +693,26 @@ class TrainingSession:
         last_test_time = time.time()
 
         for episode in range(num_episodes):
-            with Pool(processes=num_workers) as pool:
-                env_args = [
-                    (envs[i % num_tables], agents_per_table[i % num_tables], self.processor, s_per_worker, device, i % num_tables, hand_history)
-                    for i in range(num_workers)
-                ]
-                results = pool.map(collect_experience, env_args)
+            result_queues = [Queue() for _ in range(num_workers)]
+            processes = []
+            
+            for i in range(num_workers):
+                env = envs[i % num_tables]
+                agents = agents_per_table[i % num_tables]
+                p = Process(
+                    target=collect_experience,
+                    args=((env, agents, self.processor, steps_per_worker, device, i % num_tables, hand_history, result_queues[i]),)
+                )
+                p.start()
+                processes.append(p)
+            
+            results = []
+            for q in result_queues:
+                result = q.get()
+                results.append(result)
+            
+            for p in processes:
+                p.join()
 
             for exp_list, local_stats in results:
                 for exp in exp_list:
@@ -775,12 +741,19 @@ class TrainingSession:
                 logging.info(f"Episode {episode} | Avg Loss: {avg_loss:.4f} | Epsilon: {epsilon_val:.4f} | "
                              f"LR: {current_lr:.2e} | Total Hands: {total_hands} | Folds Strong: {folds_strong:.2f} | "
                              f"Bluffs Weak: {bluffs_weak:.2f}")
-            
+                writer.add_scalar('Loss/Avg', avg_loss, episode)
+                writer.add_scalar('Epsilon', epsilon_val, episode)
+                writer.add_scalar('Hands/Total', total_hands, episode)
+                writer.add_scalar('Errors/Folds_Strong', folds_strong, episode)
+                writer.add_scalar('Errors/Bluffs_Weak', bluffs_weak, episode)
+
             if time.time() - last_test_time >= test_interval:
-                test_reward, action_freq = tournament(test_env, 20)  # Уменьшено для отладки
+                test_reward, action_freq = tournament(test_env, 20)
                 winrates.append(test_reward)
                 logging.info(f"Test at Episode {episode} | Winrate: {test_reward:.2f} | "
                              f"Fold: {action_freq['fold']:.2f} | Call: {action_freq['call']:.2f} | Raise: {action_freq['raise']:.2f}")
+                writer.add_scalar('Test/Winrate', test_reward, episode)
+                writer.add_scalars('Test/Action_Freq', action_freq, episode)
                 self.save_checkpoint(model_path)
                 if test_reward > best_winrate:
                     best_winrate = test_reward
@@ -797,7 +770,7 @@ class TrainingSession:
                 best_loss = min(best_loss, avg_loss)
                 best_winrate = max(best_winrate, avg_winrate)
 
-            if total_hands >= 10_000:  # Уменьшено для отладки
+            if total_hands >= 10_000:
                 logging.info(f"Достигнуто 10,000 раздач на эпизоде {episode}")
                 break
 
@@ -807,12 +780,14 @@ class TrainingSession:
         test_reward, action_freq = tournament(test_env, 20)
         logging.info(f"Final Winrate: {test_reward:.2f} | "
                      f"Fold: {action_freq['fold']:.2f} | Call: {action_freq['call']:.2f} | Raise: {action_freq['raise']:.2f}")
+        writer.add_scalar('Final/Winrate', test_reward, num_episodes)
+        writer.add_scalars('Final/Action_Freq', action_freq, num_episodes)
         self.save_checkpoint(model_path)
+        writer.close()
 
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
     mp.set_start_method('spawn')
-    processor = StateProcessor(noise_intensity=0.0)
     opponent_stats = SharedOpponentStats()
     session = TrainingSession()
     try:
