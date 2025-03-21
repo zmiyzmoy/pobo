@@ -21,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 import shutil
 
 # ========== КОНФИГУРАЦИЯ ==========
-model_path = '/home/gunelmikayilova91/pobo/pai.pt'  # Обновлённый путь
+model_path = '/home/gunelmikayilova91/pobo/pai.pt'
 best_model_path = '/home/gunelmikayilova91/pobo/pai_best.pt'
 log_dir = '/home/gunelmikayilova91/pobo/logs/'
 os.makedirs(log_dir, exist_ok=True)
@@ -389,11 +389,11 @@ def collect_experience(args):
     for _ in range(num_steps):
         player_id = env.timestep % len(agents)
         position = env.game.get_player_id()
-        active_players = len([p for p in env.game.players if not p.is_out()])
-        bets = [env.game.players[i].in_chips if not env.game.players[i].is_out() else 0 for i in range(6)]
+        active_players = len([p for p in env.game.players if p.status != 'folded'])
+        bets = [env.game.players[i].in_chips if env.game.players[i].status != 'folded' else 0 for i in range(6)]
         stacks = [p.remain_chips for p in env.game.players]
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and not env.game.players[i].is_out()])
+        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and env.game.players[i].status != 'folded'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
         next_state, reward, done, _ = env.step(action)
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
@@ -422,11 +422,11 @@ def tournament(env, num):
         while not done:
             player_id = env.timestep % env.num_players
             position = env.game.get_player_id()
-            active_players = len([p for p in env.game.players if not p.is_out()])
-            bets = [env.game.players[i].in_chips if not env.game.players[i].is_out() else 0 for i in range(6)]
+            active_players = len([p for p in env.game.players if p.status != 'folded'])
+            bets = [env.game.players[i].in_chips if env.game.players[i].status != 'folded' else 0 for i in range(6)]
             stacks = [p.remain_chips for p in env.game.players]
             stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-            opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and not env.game.players[i].is_out()])
+            opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i != player_id and env.game.players[i].status != 'folded'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
             state, reward, done, _ = env.step(action)
             if player_id == 0:
@@ -639,8 +639,8 @@ class TrainingSession:
 # ========== ЗАПУСК ==========
 if __name__ == "__main__":
     mp.set_start_method('spawn')
-    processor = StateProcessor(noise_intensity=0.0)  # Глобальный процессор для всех агентов
-    opponent_stats = SharedOpponentStats()  # Глобальная статистика
+    processor = StateProcessor(noise_intensity=0.0)
+    opponent_stats = SharedOpponentStats()
     session = TrainingSession()
     try:
         session.train()
