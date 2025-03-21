@@ -26,8 +26,14 @@ model_path = '/home/gunelmikayilova91/rlcard/pai.pt'
 best_model_path = '/home/gunelmikayilova91/rlcard/pai_best.pt'
 log_dir = '/home/gunelmikayilova91/rlcard/logs/'
 os.makedirs(log_dir, exist_ok=True)
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s',
-                    handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(log_dir, 'training.log')),
+        logging.StreamHandler()
+    ]
+)
 writer = SummaryWriter(log_dir=log_dir)
 
 num_episodes = 10
@@ -166,6 +172,10 @@ def cached_evaluate(player_cards, community_cards):
         return 0.5
 
 def extract_cards(state_dict, stage):
+    """
+    Extract and convert player and community cards from the state dictionary.
+    Cards are converted to integers in the range 0-51 using the treys library.
+    """
     try:
         if 'raw_obs' not in state_dict:
             logging.warning("No 'raw_obs' in state_dict")
@@ -187,26 +197,27 @@ def extract_cards(state_dict, stage):
 
         logging.debug(f"Raw player_cards: {player_cards}, raw community_cards: {community_cards}")
 
+        # Define mappings for suits and ranks
+        suits = {'S': 's', 'H': 'h', 'D': 'd', 'C': 'c'}
+        ranks = {'2': '2', '3': '3', '4': '4', '5': '5', '6': '6', '7': '7', '8': '8', '9': '9',
+                 'T': 't', 'J': 'j', 'Q': 'q', 'K': 'k', 'A': 'a'}
+
         player_cards_converted = []
         for card in player_cards:
             if not isinstance(card, str) or len(card) < 2:
                 logging.error(f"Invalid card format in player_cards: {card}")
                 continue
             try:
-                suit = card[0].lower()
+                suit = card[0].upper()
                 rank = card[1:]
-                if rank == 'J':
-                    rank = 'j'
-                elif rank == 'Q':
-                    rank = 'q'
-                elif rank == 'K':
-                    rank = 'k'
-                elif rank == 'A':
-                    rank = 'a'
-                elif rank == '10':
-                    rank = 't'
-                treys_card = f"{rank}{suit}"
+                if suit not in suits or rank not in ranks:
+                    logging.error(f"Invalid suit or rank in card {card}: suit={suit}, rank={rank}")
+                    continue
+                treys_card = f"{ranks[rank]}{suits[suit]}"
                 card_int = Card.new(treys_card)
+                if not (0 <= card_int <= 51):
+                    logging.error(f"Card {card} converted to invalid value: {card_int}")
+                    continue
                 player_cards_converted.append(card_int)
             except Exception as e:
                 logging.error(f"Failed to convert player card {card}: {str(e)}")
@@ -218,20 +229,16 @@ def extract_cards(state_dict, stage):
                 logging.error(f"Invalid card format in community_cards: {card}")
                 continue
             try:
-                suit = card[0].lower()
+                suit = card[0].upper()
                 rank = card[1:]
-                if rank == 'J':
-                    rank = 'j'
-                elif rank == 'Q':
-                    rank = 'q'
-                elif rank == 'K':
-                    rank = 'k'
-                elif rank == 'A':
-                    rank = 'a'
-                elif rank == '10':
-                    rank = 't'
-                treys_card = f"{rank}{suit}"
+                if suit not in suits or rank not in ranks:
+                    logging.error(f"Invalid suit or rank in card {card}: suit={suit}, rank={rank}")
+                    continue
+                treys_card = f"{ranks[rank]}{suits[suit]}"
                 card_int = Card.new(treys_card)
+                if not (0 <= card_int <= 51):
+                    logging.error(f"Card {card} converted to invalid value: {card_int}")
+                    continue
                 community_cards_converted.append(card_int)
             except Exception as e:
                 logging.error(f"Failed to convert community card {card}: {str(e)}")
@@ -258,8 +265,13 @@ class CardEmbedding(nn.Module):
             ranks = []
             suits = []
             for card in cards:
-                ranks.append(Card.get_rank_int(card) - 2)
-                suits.append(Card.get_suit_int(card))
+                if not (0 <= card <= 51):
+                    logging.error(f"Invalid card index for embedding: {card}")
+                    return torch.zeros(12).to(device)
+                rank = Card.get_rank_int(card)  # 0 to 12
+                suit = Card.get_suit_int(card)  # 0 to 3
+                ranks.append(rank)
+                suits.append(suit)
             
             ranks = torch.tensor(ranks, dtype=torch.long).to(device)
             suits = torch.tensor(suits, dtype=torch.long).to(device)
@@ -329,6 +341,9 @@ class StateProcessor:
             raise ValueError("State dict missing 'obs' key")
         stage_array = np.array(stage)
         obs_array = state_dict['obs']
+        # Ensure obs_array is a list to avoid slicing issues
+        if isinstance(obs_array, np.ndarray):
+            obs_array = obs_array.tolist()
         obs = torch.FloatTensor(obs_array[52:] if stage_array[1:].any() else obs_array[52:]).to(device)
         if self.noise_intensity > 0:
             noise = torch.normal(0, self.noise_intensity, obs.shape).to(device)
@@ -437,6 +452,7 @@ class CustomDQNAgent:
                 logging.error(f"State is not a dict: {type(state)}, value: {state}")
                 state = {'obs': np.zeros(82), 'legal_actions': OrderedDict({0: None, 1: None, 3: None, 4: None}), 'raw_obs': {}}
 
+            # Standardize legal_actions handling
             legal_actions = []
             if 'legal_actions' in state:
                 la = state['legal_actions']
@@ -460,14 +476,15 @@ class CustomDQNAgent:
 
             logging.debug(f"Processed legal_actions: {legal_actions}")
 
+            # Convert state['obs'] to a list to avoid slicing issues
             if 'obs' in state:
                 if isinstance(state['obs'], dict) and 'obs' in state['obs']:
                     if isinstance(state['obs']['obs'], np.ndarray):
                         state['obs']['obs'] = state['obs']['obs'].tolist()
-                        logging.debug(f"Converted state['obs']['obs'] to list to avoid slice issues: {state['obs']['obs'][:10]}")
+                        logging.debug(f"Converted state['obs']['obs'] to list: {state['obs']['obs'][:10]}")
                 elif isinstance(state['obs'], np.ndarray):
                     state['obs'] = state['obs'].tolist()
-                    logging.debug(f"Converted state['obs'] to list to avoid slice issues: {state['obs'][:10]}")
+                    logging.debug(f"Converted state['obs'] to list: {state['obs'][:10]}")
 
             processed_state = self.processor.process(
                 state, position, active_players, 
@@ -476,6 +493,7 @@ class CustomDQNAgent:
             state_tensor = torch.FloatTensor(processed_state).to(device).unsqueeze(0)
 
             if np.random.rand() < self.epsilon:
+                # Random action: ensure it's legal
                 action = random.choice(legal_actions)
                 if action > 1:
                     player_cards, community_cards = extract_cards(state, stage)
@@ -485,19 +503,24 @@ class CustomDQNAgent:
                     logging.debug(f"Dynamic bet size calculated: {bet_size}")
                     pot = sum(bets)
                     my_stack = stacks[position]
-                    if bet_size >= my_stack:
-                        action = 4
-                    elif bet_size >= pot:
-                        action = 3
+                    # Map bet size to a legal action
+                    if bet_size >= my_stack and 4 in legal_actions:
+                        action = 4  # ALL_IN
+                    elif bet_size >= pot and 3 in legal_actions:
+                        action = 3  # RAISE_POT
+                    elif 2 in legal_actions:
+                        action = 2  # RAISE_HALF_POT
                     else:
-                        action = 3
+                        # Fallback to a safe action
+                        action = 1 if 1 in legal_actions else 0
                     logging.debug(f"Mapped bet size {bet_size} to action: {action}")
             else:
                 with torch.no_grad():
                     q_values = self.model(state_tensor)
                     noise = torch.normal(0, noise_scale, q_values.shape).to(device)
                     q_values += noise
-                    logging.debug(f"Q-values: {q_values}, legal_actions before indexing: {legal_actions}")
+                    logging.debug(f"Q-values: {q_values}, legal_actions: {legal_actions}")
+                    # Filter Q-values to only consider legal actions
                     legal_q = q_values[0, legal_actions]
                     action_idx = torch.argmax(legal_q).item()
                     action = legal_actions[action_idx]
@@ -509,12 +532,16 @@ class CustomDQNAgent:
                         logging.debug(f"Dynamic bet size calculated: {bet_size}")
                         pot = sum(bets)
                         my_stack = stacks[position]
-                        if bet_size >= my_stack:
-                            action = 4
-                        elif bet_size >= pot:
-                            action = 3
+                        # Map bet size to a legal action
+                        if bet_size >= my_stack and 4 in legal_actions:
+                            action = 4  # ALL_IN
+                        elif bet_size >= pot and 3 in legal_actions:
+                            action = 3  # RAISE_POT
+                        elif 2 in legal_actions:
+                            action = 2  # RAISE_HALF_POT
                         else:
-                            action = 3
+                            # Fallback to a safe action
+                            action = 1 if 1 in legal_actions else 0
                         logging.debug(f"Mapped bet size {bet_size} to action: {action}")
 
             self.action_history.append(action)
@@ -539,6 +566,7 @@ def collect_experience(args):
         state = env.reset()
         logging.debug(f"Initial state after env.reset(): {state}")
         
+        # Process the initial state once and reuse for all players
         if not isinstance(state, list):
             if isinstance(state, tuple):
                 obs_part = state[0]
@@ -557,7 +585,6 @@ def collect_experience(args):
                     'legal_actions': legal_actions_dict,
                     'raw_obs': obs_part
                 }
-                state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
             elif isinstance(state, dict):
                 legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                 if isinstance(legal_actions_dict, list):
@@ -569,12 +596,15 @@ def collect_experience(args):
                     'legal_actions': legal_actions_dict,
                     'raw_obs': state.get('raw_obs', {})
                 }
-                state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
             else:
                 logging.error(f"Invalid initial state type: {type(state)}, value: {state}")
                 result_queue.put(([], local_opponent_stats))
                 return
+        else:
+            state_dict = state[0]
 
+        # Create a list of state dictionaries for all players
+        state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
         logging.debug(f"Processed initial state: {state}")
 
         for step_idx in range(num_steps):
@@ -615,7 +645,7 @@ def collect_experience(args):
             logging.debug(f"Agent {player_id} chose action: {action}")
             
             try:
-                next_state, player_id = env.step(action)
+                next_state, _ = env.step(action)
             except Exception as e:
                 logging.error(f"Experience collection crashed: {str(e)}")
                 break
@@ -642,6 +672,7 @@ def collect_experience(args):
             
             logging.debug(f"Next state after env.step(action={action}): {next_state}")
             
+            # Process the next state once and reuse for all players
             if not isinstance(next_state, list):
                 if isinstance(next_state, tuple):
                     next_obs = next_state[0]
@@ -660,7 +691,6 @@ def collect_experience(args):
                         'legal_actions': next_legal_dict,
                         'raw_obs': next_obs
                     }
-                    next_state = [copy.deepcopy(next_state_dict) for _ in range(env.num_players)]
                 elif isinstance(next_state, dict):
                     next_legal_dict = next_state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                     if isinstance(next_legal_dict, list):
@@ -672,12 +702,13 @@ def collect_experience(args):
                         'legal_actions': next_legal_dict,
                         'raw_obs': next_state.get('raw_obs', {})
                     }
-                    next_state = [copy.deepcopy(next_state_dict) for _ in range(env.num_players)]
                 else:
                     logging.error(f"Invalid next_state type: {type(next_state)}, value: {next_state}")
                     break
+            else:
+                next_state_dict = next_state[0]
 
-            state = next_state
+            state = [copy.deepcopy(next_state_dict) for _ in range(env.num_players)]
 
             total_reward = reward
             local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
@@ -713,7 +744,6 @@ def collect_experience(args):
                             'legal_actions': legal_actions_dict,
                             'raw_obs': obs_part
                         }
-                        state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
                     elif isinstance(state, dict):
                         legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                         if isinstance(legal_actions_dict, list):
@@ -725,10 +755,16 @@ def collect_experience(args):
                             'legal_actions': legal_actions_dict,
                             'raw_obs': state.get('raw_obs', {})
                         }
-                        state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
                     else:
                         logging.error(f"Invalid reset state type: {type(state)}, value: {state}")
-                        state = [state[player_id]] * env.num_players
+                        state_dict = {
+                            'obs': np.zeros(82),
+                            'legal_actions': OrderedDict({0: None, 1: None, 3: None, 4: None}),
+                            'raw_obs': {}
+                        }
+                else:
+                    state_dict = state[0]
+                state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
 
             step_duration = time.time() - step_start_time
             logging.debug(f"Step {step_idx + 1}/{num_steps} completed in {step_duration:.2f} seconds")
@@ -760,9 +796,9 @@ def tournament(env, num):
         if not isinstance(state, list):
             if isinstance(state, tuple):
                 state_dict = {'obs': state[0], 'legal_actions': state[1], 'raw_obs': state[0]}
-                state = [state_dict] * env.num_players
             else:
-                state = [state] * env.num_players
+                state_dict = state
+            state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
         done = False
         while not done:
             player_id = env.timestep % env.num_players
@@ -773,15 +809,15 @@ def tournament(env, num):
             stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
             opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
-            state, player_id = env.step(action)
+            state, _ = env.step(action)
             reward = 0
             done = False
             if not isinstance(state, list):
                 if isinstance(state, tuple):
                     state_dict = {'obs': state[0], 'legal_actions': state[1], 'raw_obs': state[0]}
-                    state = [state_dict] * env.num_players
                 else:
-                    state = [state] * env.num_players
+                    state_dict = state
+                state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
             if player_id == 0:
                 total_reward += reward
                 if action == 0:
