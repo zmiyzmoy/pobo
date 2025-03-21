@@ -375,17 +375,13 @@ class CustomDQNAgent:
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         logging.debug(f"Step input: state type={type(state)}, state={state}")
-        if isinstance(state, tuple):
-            state_dict = state[0]
-        else:
-            state_dict = state
-        if not isinstance(state_dict, dict):
-            logging.error(f"State is not a dict: type={type(state_dict)}, value={state_dict}")
-            raise ValueError(f"Invalid state format: expected dict, got {type(state_dict)}")
-        legal_actions = list(state_dict['legal_actions'].keys())
-        player_cards, community_cards = extract_cards(state_dict, stage)
+        if not isinstance(state, dict):
+            logging.error(f"State is not a dict: type={type(state)}, value={state}")
+            raise ValueError(f"Invalid state format: expected dict, got {type(state)}")
+        legal_actions = list(state['legal_actions'].keys())  # Используем state напрямую
+        player_cards, community_cards = extract_cards(state, stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
-        processed_state = processor.process(state_dict, position, active_players, bets, stacks, stage, opponent_behaviors)
+        processed_state = processor.process(state, position, active_players, bets, stacks, stage, opponent_behaviors)
         state_tensor = torch.FloatTensor(processed_state).to(device).unsqueeze(0)
 
         if np.random.rand() < self.epsilon:
