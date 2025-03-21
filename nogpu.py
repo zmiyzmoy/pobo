@@ -18,7 +18,8 @@ from treys import Evaluator, Card
 from functools import lru_cache
 from torch.utils.tensorboard import SummaryWriter
 import shutil
-import sys  # Добавляем для управления выводом tqdm
+import sys
+import copy
 
 # ========== КОНФИГУРАЦИЯ ==========
 model_path = '/home/gunelmikayilova91/rlcard/pai.pt'
@@ -29,15 +30,15 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s',
                     handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
 writer = SummaryWriter(log_dir=log_dir)
 
-num_episodes = 10  # Уменьшено для отладки
+num_episodes = 10
 batch_size = 512
 gamma = 0.96
 epsilon_start = 1.0
 epsilon_end = 0.01
 target_update_freq = 1000
 buffer_capacity = 500_000
-num_workers = 1  # Уменьшено для CPU
-steps_per_worker = 1000  # Увеличено с 100 до 1000, так как это помогло избежать зависания
+num_workers = 1
+steps_per_worker = 1000
 selfplay_update_freq = 5000
 log_freq = 25
 test_interval = 2000
@@ -46,11 +47,11 @@ early_stop_threshold = 0.001
 learning_rate = 1e-4
 noise_scale = 0.1
 num_tables = 1
-num_players = 6  # Установлено 6 игроков
+num_players = 6
 code_version = "v1.9_test"
 grad_clip_value = 5.0
 
-device = torch.device("cpu")  # Фиксируем CPU для тестовой машины
+device = torch.device("cpu")
 
 # ========== НОРМАЛИЗАЦИЯ НАГРАД ==========
 class RewardNormalizer:
@@ -148,8 +149,17 @@ def cached_evaluate(player_cards, community_cards):
         community_cards = tuple()
     
     try:
+        for card in player_cards:
+            if not isinstance(card, int) or card < 0 or card > 51:
+                logging.error(f"Invalid player card value: {card}")
+                return 0.5
+        for card in community_cards:
+            if not isinstance(card, int) or card < 0 or card > 51:
+                logging.error(f"Invalid community card value: {card}")
+                return 0.5
+
         score = evaluator.evaluate(list(community_cards), list(player_cards))
-        normalized_score = 1.0 - (score / 7462.0)  # Нормализация: 0 (худшая рука) до 1 (лучшая рука)
+        normalized_score = 1.0 - (score / 7462.0)
         return normalized_score
     except Exception as e:
         logging.error(f"Error in cached_evaluate: {str(e)}")
@@ -162,10 +172,12 @@ def extract_cards(state_dict, stage):
             return (), ()
             
         raw_obs = state_dict['raw_obs']
+        if isinstance(raw_obs, dict) and 'raw_obs' in raw_obs:
+            raw_obs = raw_obs['raw_obs']
+            
         player_cards = raw_obs.get('hand', [])
         community_cards = raw_obs.get('public_cards', [])
         
-        # Проверяем, что карты в правильном формате
         if not player_cards:
             logging.warning("No player cards found in state")
             return (), ()
@@ -173,22 +185,16 @@ def extract_cards(state_dict, stage):
             logging.warning(f"Community cards is not a list: {community_cards}")
             community_cards = []
 
-        # Логируем сырые карты
         logging.debug(f"Raw player_cards: {player_cards}, raw community_cards: {community_cards}")
 
-        # Преобразуем карты из строкового формата в числовой (для treys)
         player_cards_converted = []
         for card in player_cards:
             if not isinstance(card, str) or len(card) < 2:
                 logging.error(f"Invalid card format in player_cards: {card}")
                 continue
             try:
-                # Исправление: Убедимся, что формат карты соответствует ожидаемому в treys
-                # RLCard использует формат 'SJ' (валет пик), но treys ожидает 'Js'
-                # Преобразуем масть: S -> s, H -> h, D -> d, C -> c
-                # Преобразуем ранг: J -> j, Q -> q, K -> k, A -> a, 10 -> t
-                suit = card[0].lower()  # Масть: S -> s, H -> h, D -> d, C -> c
-                rank = card[1:]  # Ранг: J, Q, K, A или число
+                suit = card[0].lower()
+                rank = card[1:]
                 if rank == 'J':
                     rank = 'j'
                 elif rank == 'Q':
@@ -199,8 +205,8 @@ def extract_cards(state_dict, stage):
                     rank = 'a'
                 elif rank == '10':
                     rank = 't'
-                treys_card = f"{rank}{suit}"  # Формат для treys: 'Js' вместо 'SJ'
-                card_int = Card.new(treys_card)  # Преобразуем в формат treys
+                treys_card = f"{rank}{suit}"
+                card_int = Card.new(treys_card)
                 player_cards_converted.append(card_int)
             except Exception as e:
                 logging.error(f"Failed to convert player card {card}: {str(e)}")
@@ -212,7 +218,6 @@ def extract_cards(state_dict, stage):
                 logging.error(f"Invalid card format in community_cards: {card}")
                 continue
             try:
-                # Аналогичное преобразование для общих карт
                 suit = card[0].lower()
                 rank = card[1:]
                 if rank == 'J':
@@ -237,12 +242,13 @@ def extract_cards(state_dict, stage):
     except Exception as e:
         logging.error(f"Error in extract_cards: {str(e)}")
         return (), ()
+
 # ========== EMBEDDING КАРТ ==========
 class CardEmbedding(nn.Module):
     def __init__(self):
         super().__init__()
-        self.rank_embed = nn.Embedding(13, 8)  # 13 рангов (2-A)
-        self.suit_embed = nn.Embedding(4, 4)   # 4 масти
+        self.rank_embed = nn.Embedding(13, 8)
+        self.suit_embed = nn.Embedding(4, 4)
         
     def forward(self, cards):
         try:
@@ -252,7 +258,7 @@ class CardEmbedding(nn.Module):
             ranks = []
             suits = []
             for card in cards:
-                ranks.append(Card.get_rank_int(card) - 2)  # Приводим к диапазону 0-12
+                ranks.append(Card.get_rank_int(card) - 2)
                 suits.append(Card.get_suit_int(card))
             
             ranks = torch.tensor(ranks, dtype=torch.long).to(device)
@@ -421,19 +427,16 @@ class CustomDQNAgent:
             recent_avg = np.mean(self.reward_buffer)
             decay_factor = 0.98 if recent_avg < 0 else 0.95
             self.epsilon = max(epsilon_end, self.epsilon * decay_factor)
-            # Добавлено: Логируем изменение epsilon
             logging.debug(f"Epsilon updated to {self.epsilon:.4f}, recent reward avg: {recent_avg:.4f}")
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         try:
             logging.debug(f"Agent step called with state: {state}")
             
-            # Проверяем, что state — это словарь
             if not isinstance(state, dict):
                 logging.error(f"State is not a dict: {type(state)}, value: {state}")
                 state = {'obs': np.zeros(82), 'legal_actions': OrderedDict({0: None, 1: None, 3: None, 4: None}), 'raw_obs': {}}
 
-            # Извлекаем legal_actions
             legal_actions = []
             if 'legal_actions' in state:
                 la = state['legal_actions']
@@ -451,17 +454,20 @@ class CustomDQNAgent:
                 logging.warning(f"No 'legal_actions' in state: {state}")
                 legal_actions = [0, 1, 3, 4]
 
-            # Проверяем, что legal_actions содержит только целые числа
             if not legal_actions or not all(isinstance(a, (int, np.integer)) for a in legal_actions):
                 logging.error(f"Invalid legal_actions: {legal_actions}")
                 legal_actions = [0, 1, 3, 4]
 
             logging.debug(f"Processed legal_actions: {legal_actions}")
 
-            # Исправление: Преобразуем state['obs'] в список, чтобы избежать проблем со срезами
-            if 'obs' in state and isinstance(state['obs'], np.ndarray):
-                state['obs'] = state['obs'].tolist()
-                logging.debug(f"Converted state['obs'] to list to avoid slice issues: {state['obs'][:10]}")
+            if 'obs' in state:
+                if isinstance(state['obs'], dict) and 'obs' in state['obs']:
+                    if isinstance(state['obs']['obs'], np.ndarray):
+                        state['obs']['obs'] = state['obs']['obs'].tolist()
+                        logging.debug(f"Converted state['obs']['obs'] to list to avoid slice issues: {state['obs']['obs'][:10]}")
+                elif isinstance(state['obs'], np.ndarray):
+                    state['obs'] = state['obs'].tolist()
+                    logging.debug(f"Converted state['obs'] to list to avoid slice issues: {state['obs'][:10]}")
 
             processed_state = self.processor.process(
                 state, position, active_players, 
@@ -474,11 +480,18 @@ class CustomDQNAgent:
                 if action > 1:
                     player_cards, community_cards = extract_cards(state, stage)
                     hand_strength = cached_evaluate(player_cards, community_cards)
-                    # Добавлено: Логируем силу руки
                     logging.debug(f"Random action, hand strength: {hand_strength:.4f}")
-                    action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-                    # Добавлено: Логируем размер ставки
-                    logging.debug(f"Dynamic bet size calculated: {action}")
+                    bet_size = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
+                    logging.debug(f"Dynamic bet size calculated: {bet_size}")
+                    pot = sum(bets)
+                    my_stack = stacks[position]
+                    if bet_size >= my_stack:
+                        action = 4
+                    elif bet_size >= pot:
+                        action = 3
+                    else:
+                        action = 3
+                    logging.debug(f"Mapped bet size {bet_size} to action: {action}")
             else:
                 with torch.no_grad():
                     q_values = self.model(state_tensor)
@@ -491,11 +504,18 @@ class CustomDQNAgent:
                     if action > 1:
                         player_cards, community_cards = extract_cards(state, stage)
                         hand_strength = cached_evaluate(player_cards, community_cards)
-                        # Добавлено: Логируем силу руки
-                        logging.debug(f"Q-value based action, hand strength: {hand_strength:.4f}")
-                        action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-                        # Добавлено: Логируем размер ставки
-                        logging.debug(f"Dynamic bet size calculated: {action}")
+                        logging.debug(f"Computed hand strength: {hand_strength}")
+                        bet_size = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
+                        logging.debug(f"Dynamic bet size calculated: {bet_size}")
+                        pot = sum(bets)
+                        my_stack = stacks[position]
+                        if bet_size >= my_stack:
+                            action = 4
+                        elif bet_size >= pot:
+                            action = 3
+                        else:
+                            action = 3
+                        logging.debug(f"Mapped bet size {bet_size} to action: {action}")
 
             self.action_history.append(action)
             logging.debug(f"Agent chose action: {action}")
@@ -506,6 +526,7 @@ class CustomDQNAgent:
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         return self.step(state, position, active_players, bets, stacks, stage, opponent_behaviors), {}
+
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
     env, agents, processor, num_steps, device, table_id, hand_history, result_queue = args
@@ -514,11 +535,10 @@ def collect_experience(args):
     
     try:
         logging.info(f"Starting collect_experience for table {table_id} with {num_steps} steps")
-        start_time = time.time()  # Добавлено: Логируем время начала сбора опыта
+        start_time = time.time()
         state = env.reset()
         logging.debug(f"Initial state after env.reset(): {state}")
         
-        # Проверяем, что state корректный
         if not isinstance(state, list):
             if isinstance(state, tuple):
                 obs_part = state[0]
@@ -537,20 +557,19 @@ def collect_experience(args):
                     'legal_actions': legal_actions_dict,
                     'raw_obs': obs_part
                 }
-                state = [state_dict] * env.num_players
+                state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
             elif isinstance(state, dict):
                 legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                 if isinstance(legal_actions_dict, list):
                     legal_actions_dict = OrderedDict((a, None) for a in legal_actions_dict)
                 elif not isinstance(legal_actions_dict, (dict, OrderedDict)):
-                    logging.warning(f"Unexpected legal_actions_dict type in initial state: {type(legal_actions_dict)}, value: {legal_actions_dict}")
                     legal_actions_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
                 state_dict = {
                     'obs': state.get('obs', np.zeros(82)),
                     'legal_actions': legal_actions_dict,
                     'raw_obs': state.get('raw_obs', {})
                 }
-                state = [state_dict] * env.num_players
+                state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
             else:
                 logging.error(f"Invalid initial state type: {type(state)}, value: {state}")
                 result_queue.put(([], local_opponent_stats))
@@ -559,8 +578,8 @@ def collect_experience(args):
         logging.debug(f"Processed initial state: {state}")
 
         for step_idx in range(num_steps):
-            logging.debug(f"Step {step_idx + 1}/{num_steps} started for table {table_id}")  # Добавлено: Логируем начало каждого шага
-            step_start_time = time.time()  # Добавлено: Логируем время начала шага
+            logging.debug(f"Step {step_idx + 1}/{num_steps} started for table {table_id}")
+            step_start_time = time.time()
             player_id = env.timestep % env.num_players
             position = env.game.get_player_id()
             active_players = len([p for p in env.game.players if p.status == 'alive'])
@@ -582,7 +601,6 @@ def collect_experience(args):
                 if i != player_id
             ])
             
-            # Логируем state перед вызовом step
             logging.debug(f"Step {step_idx + 1}/{num_steps}, player {player_id}, state: {state[player_id]}")
             
             action = agents[player_id].step(
@@ -596,14 +614,34 @@ def collect_experience(args):
             )
             logging.debug(f"Agent {player_id} chose action: {action}")
             
-            next_state, player_id = env.step(action)
-            reward = 0  # Временное значение
-            done = False  # Временное значение
+            try:
+                next_state, player_id = env.step(action)
+            except Exception as e:
+                logging.error(f"Experience collection crashed: {str(e)}")
+                break
+                
+            reward = 0
+            if 'raw_obs' in state[player_id] and 'my_chips' in state[player_id]['raw_obs']:
+                current_chips = state[player_id]['raw_obs']['my_chips']
+                if isinstance(next_state, dict) and 'raw_obs' in next_state:
+                    next_chips = next_state.get('raw_obs', {}).get('my_chips', current_chips)
+                    reward = next_chips - current_chips
+                elif isinstance(next_state, list) and len(next_state) > player_id:
+                    next_chips = next_state[player_id].get('raw_obs', {}).get('my_chips', current_chips)
+                    reward = next_chips - current_chips
+
+            done = False
+            if isinstance(next_state, dict) and 'raw_obs' in next_state:
+                done = next_state['raw_obs'].get('stage', 0) == 4
+            elif isinstance(next_state, list) and len(next_state) > player_id:
+                done = next_state[player_id].get('raw_obs', {}).get('stage', 0) == 4
+
+            experience = (state[player_id], action, reward, next_state[player_id] if isinstance(next_state, list) else next_state, done)
+            experiences.append(experience)
+            logging.debug(f"Collected experience: {experience}")
             
-            # Логируем next_state после env.step
             logging.debug(f"Next state after env.step(action={action}): {next_state}")
             
-            # Проверяем, что next_state корректный
             if not isinstance(next_state, list):
                 if isinstance(next_state, tuple):
                     next_obs = next_state[0]
@@ -617,33 +655,33 @@ def collect_experience(args):
                         next_legal_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
                         logging.warning(f"Unexpected next_legal type: {type(next_legal)}, value: {next_legal}")
                         
-                    next_state = [{
+                    next_state_dict = {
                         'obs': next_obs,
                         'legal_actions': next_legal_dict,
                         'raw_obs': next_obs
-                    }] * env.num_players
+                    }
+                    next_state = [copy.deepcopy(next_state_dict) for _ in range(env.num_players)]
                 elif isinstance(next_state, dict):
                     next_legal_dict = next_state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                     if isinstance(next_legal_dict, list):
                         next_legal_dict = OrderedDict((a, None) for a in next_legal_dict)
                     elif not isinstance(next_legal_dict, (dict, OrderedDict)):
-                        logging.warning(f"Unexpected next_legal_dict type: {type(next_legal_dict)}, value: {next_legal_dict}")
                         next_legal_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
-                    next_state = [{
+                    next_state_dict = {
                         'obs': next_state.get('obs', np.zeros(82)),
                         'legal_actions': next_legal_dict,
                         'raw_obs': next_state.get('raw_obs', {})
-                    }] * env.num_players
+                    }
+                    next_state = [copy.deepcopy(next_state_dict) for _ in range(env.num_players)]
                 else:
                     logging.error(f"Invalid next_state type: {type(next_state)}, value: {next_state}")
-                    next_state = [state[player_id]] * env.num_players  # Используем старое состояние как запасной вариант
-            
-            logging.debug(f"Processed next_state: {next_state}")
+                    break
+
+            state = next_state
 
             total_reward = reward
             local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
             
-            # Логируем перед вызовом extract_cards
             logging.debug(f"Calling extract_cards with state: {state[player_id]}, stage: {stage}")
             player_cards, community_cards = extract_cards(state[player_id], stage)
             logging.debug(f"extract_cards returned player_cards: {player_cards}, community_cards: {community_cards}")
@@ -653,22 +691,6 @@ def collect_experience(args):
             
             hand_history.add(table_id, player_id, action, action if action > 1 else 0, hand_strength, stage, sum(bets))
             agents[player_id].adaptive_epsilon_decay(total_reward)
-            
-            experiences.append((
-                state[player_id],
-                action,
-                total_reward,
-                next_state[player_id],
-                done,
-                position,
-                active_players,
-                bets,
-                stacks,
-                stage,
-                opponent_behaviors
-            ))
-            
-            state = next_state
             
             if done:
                 logging.debug(f"Episode done, resetting env")
@@ -691,29 +713,26 @@ def collect_experience(args):
                             'legal_actions': legal_actions_dict,
                             'raw_obs': obs_part
                         }
-                        state = [state_dict] * env.num_players
+                        state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
                     elif isinstance(state, dict):
                         legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
                         if isinstance(legal_actions_dict, list):
                             legal_actions_dict = OrderedDict((a, None) for a in legal_actions_dict)
                         elif not isinstance(legal_actions_dict, (dict, OrderedDict)):
-                            logging.warning(f"Unexpected legal_actions_dict type after reset: {type(legal_actions_dict)}, value: {legal_actions_dict}")
                             legal_actions_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
                         state_dict = {
                             'obs': state.get('obs', np.zeros(82)),
                             'legal_actions': legal_actions_dict,
                             'raw_obs': state.get('raw_obs', {})
                         }
-                        state = [state_dict] * env.num_players
+                        state = [copy.deepcopy(state_dict) for _ in range(env.num_players)]
                     else:
                         logging.error(f"Invalid reset state type: {type(state)}, value: {state}")
                         state = [state[player_id]] * env.num_players
 
-            # Добавлено: Логируем время выполнения шага
             step_duration = time.time() - step_start_time
             logging.debug(f"Step {step_idx + 1}/{num_steps} completed in {step_duration:.2f} seconds")
 
-        # Добавлено: Логируем общее время выполнения и количество собранного опыта
         total_duration = time.time() - start_time
         logging.info(f"Finished collect_experience for table {table_id}, collected {len(experiences)} experiences in {total_duration:.2f} seconds")
         result_queue.put((experiences, local_opponent_stats))
@@ -726,18 +745,17 @@ def tournament(env, num):
     total_reward = 0
     action_counts = {'fold': 0, 'call': 0, 'raise': 0}
     total_actions = 0
-    # Проверяем, что env.game.players не равно None
     if env.game.players is None:
         logging.error("env.game.players is None, initializing default players")
         num_players_actual = env.num_players
     else:
         num_players_actual = len(env.game.players)
     
-    logging.info(f"Starting tournament with {num} episodes")  # Добавлено: Логируем начало турнира
-    start_time = time.time()  # Добавлено: Логируем время начала
+    logging.info(f"Starting tournament with {num} episodes")
+    start_time = time.time()
 
     for episode in range(num):
-        logging.debug(f"Tournament episode {episode + 1}/{num} started")  # Добавлено: Логируем начало эпизода
+        logging.debug(f"Tournament episode {episode + 1}/{num} started")
         state = env.reset()
         if not isinstance(state, list):
             if isinstance(state, tuple):
@@ -756,8 +774,8 @@ def tournament(env, num):
             opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
             state, player_id = env.step(action)
-            reward = 0  # Временное значение
-            done = False  # Временное значение
+            reward = 0
+            done = False
             if not isinstance(state, list):
                 if isinstance(state, tuple):
                     state_dict = {'obs': state[0], 'legal_actions': state[1], 'raw_obs': state[0]}
@@ -773,11 +791,10 @@ def tournament(env, num):
                 elif action > 1:
                     action_counts['raise'] += 1
                 total_actions += 1
-        logging.debug(f"Tournament episode {episode + 1}/{num} completed")  # Добавлено: Логируем завершение эпизода
+        logging.debug(f"Tournament episode {episode + 1}/{num} completed")
 
     winrate = total_reward / num
     action_freq = {k: v / total_actions if total_actions > 0 else 0 for k, v in action_counts.items()}
-    # Добавлено: Логируем общее время выполнения турнира
     total_duration = time.time() - start_time
     logging.info(f"Tournament completed in {total_duration:.2f} seconds, winrate: {winrate:.2f}, action_freq: {action_freq}")
     return winrate, action_freq
@@ -798,7 +815,6 @@ class TrainingSession:
         self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=500)
-        # Добавлено: Логируем инициализацию моделей
         logging.info(f"Models initialized with input_size={input_size}, num_actions={num_actions}")
 
     def train_epoch(self, buffer, episode):
@@ -825,7 +841,6 @@ class TrainingSession:
 
         td_errors = (current_q.squeeze() - target_q).abs().cpu().numpy()
         buffer.update_priorities(indices, td_errors)
-        # Добавлено: Логируем значение потерь
         logging.debug(f"Episode {episode}, training loss: {loss.item():.4f}")
         return loss.item()
 
@@ -853,7 +868,6 @@ class TrainingSession:
         torch.save(checkpoint, path)
         if is_best:
             shutil.copyfile(path, best_model_path)
-        # Добавлено: Логируем сохранение чекпоинта
         logging.info(f"Checkpoint saved to {path}, is_best={is_best}")
 
     def load_checkpoint(self, path):
@@ -865,7 +879,6 @@ class TrainingSession:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
         self.opponent_stats.stats = checkpoint['stats']
-        # Добавлено: Логируем загрузку чекпоинта
         logging.info(f"Checkpoint loaded from {path}")
 
     def train(self):
@@ -893,7 +906,6 @@ class TrainingSession:
         test_agents = [CustomDQNAgent(self.model, self.processor, s) for s in agent_styles[:min(num_players, test_env.num_players)]]
         test_env.set_agents(test_agents)
 
-        # Изменяем tqdm, чтобы он всегда выводился в stdout
         pbar = tqdm(total=num_episodes, desc="Обучение", dynamic_ncols=True, file=sys.stdout)
         total_hands = 0
         losses = collections.deque(maxlen=early_stop_patience)
@@ -903,8 +915,8 @@ class TrainingSession:
         last_test_time = time.time()
 
         for episode in range(num_episodes):
-            logging.info(f"Starting episode {episode + 1}/{num_episodes}")  # Добавлено: Логируем начало эпизода
-            episode_start_time = time.time()  # Добавлено: Логируем время начала эпизода
+            logging.info(f"Starting episode {episode + 1}/{num_episodes}")
+            episode_start_time = time.time()
 
             result_queues = [Queue() for _ in range(num_workers)]
             processes = []
@@ -916,36 +928,36 @@ class TrainingSession:
                     target=collect_experience,
                     args=((env, agents, self.processor, steps_per_worker, device, i % num_tables, hand_history, result_queues[i]),)
                 )
-                logging.debug(f"Starting process {i} for table {i % num_tables}")  # Добавлено: Логируем запуск процесса
+                logging.debug(f"Starting process {i} for table {i % num_tables}")
                 p.start()
                 processes.append(p)
             
             results = []
             for idx, q in enumerate(result_queues):
                 try:
-                    # Добавлено: Используем тайм-аут для Queue.get()
-                    result = q.get(timeout=60)  # Тайм-аут 60 секунд
+                    result = q.get(timeout=60)
                     results.append(result)
-                    logging.debug(f"Received result from queue {idx}, experiences: {len(result[0])}")  # Добавлено: Логируем получение результата
+                    logging.info(f"Received result from queue {idx}, experiences: {len(result[0])}")
                 except Queue.Empty:
                     logging.error(f"Queue.get() timed out after 60 seconds for queue {idx}, process likely hung")
                     for p in processes:
-                        p.terminate()  # Завершаем зависшие процессы
-                        logging.debug(f"Terminated process {p.pid}")  # Добавлено: Логируем завершение процесса
+                        p.terminate()
+                        logging.debug(f"Terminated process {p.pid}")
                     raise RuntimeError(f"Experience collection process hung for queue {idx}")
             
             for p in processes:
                 p.join()
-                logging.debug(f"Process {p.pid} joined")  # Добавлено: Логируем завершение процесса
+                logging.info(f"Process {p.pid} joined")
 
-            for exp_list, local_stats in results:
-                for exp in exp_list:
+            total_experiences = 0
+            for experiences, local_stats in results:
+                total_experiences += len(experiences)
+                for exp in experiences:
                     self.reward_normalizer.update(exp[2])
                     buffer.add(exp, priority=1.0)
                     total_hands += 1
                 self.opponent_stats.merge(local_stats)
-                # Добавлено: Логируем количество добавленного опыта
-                logging.debug(f"Added {len(exp_list)} experiences to buffer, total hands: {total_hands}")
+            logging.info(f"Added {total_experiences} experiences to buffer, total hands: {total_hands}")
 
             if len(buffer) > batch_size:
                 loss = self.train_epoch(buffer, episode)
@@ -953,14 +965,12 @@ class TrainingSession:
 
             if episode % target_update_freq == 0:
                 self.target_model.load_state_dict(self.model.state_dict())
-                # Добавлено: Логируем обновление целевой модели
                 logging.info(f"Target model updated at episode {episode}")
 
             if episode % selfplay_update_freq == 0:
                 for table_agents in agents_per_table:
                     for agent in table_agents:
                         agent.model.load_state_dict(self.model.state_dict())
-                # Добавлено: Логируем обновление моделей агентов
                 logging.info(f"Agent models updated for self-play at episode {episode}")
 
             if episode % log_freq == 0 and len(losses) > 0:
@@ -1004,7 +1014,6 @@ class TrainingSession:
                 logging.info(f"Достигнуто 10,000 раздач на эпизоде {episode}")
                 break
 
-            # Добавлено: Логируем время выполнения эпизода
             episode_duration = time.time() - episode_start_time
             logging.info(f"Episode {episode + 1}/{num_episodes} completed in {episode_duration:.2f} seconds")
 
