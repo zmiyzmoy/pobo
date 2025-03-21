@@ -18,6 +18,7 @@ from treys import Evaluator, Card
 from functools import lru_cache
 from torch.utils.tensorboard import SummaryWriter
 import shutil
+import sys  # Добавляем для управления выводом tqdm
 
 # ========== КОНФИГУРАЦИЯ ==========
 model_path = '/home/gunelmikayilova91/rlcard/pai.pt'
@@ -36,7 +37,7 @@ epsilon_end = 0.01
 target_update_freq = 1000
 buffer_capacity = 500_000
 num_workers = 4  # Уменьшено для CPU
-steps_per_worker = 1000
+steps_per_worker = 5000
 selfplay_update_freq = 5000
 log_freq = 25
 test_interval = 2000
@@ -695,7 +696,8 @@ class TrainingSession:
         test_agents = [CustomDQNAgent(self.model, self.processor, s) for s in agent_styles[:min(num_players, test_env.num_players)]]
         test_env.set_agents(test_agents)
 
-        pbar = tqdm(total=num_episodes, desc="Обучение", dynamic_ncols=True)
+        # Изменяем tqdm, чтобы он всегда выводился в stdout
+        pbar = tqdm(total=num_episodes, desc="Обучение", dynamic_ncols=True, file=sys.stdout)
         total_hands = 0
         losses = collections.deque(maxlen=early_stop_patience)
         winrates = collections.deque(maxlen=early_stop_patience)
