@@ -333,52 +333,21 @@ class CustomDQNAgent:
         self.reward_buffer = collections.deque(maxlen=100)
         self.action_history = collections.deque(maxlen=5)
 
-    def dynamic_bet_size(self, stacks, bets, position, opponent_behaviors, hand_strength, stage):
-        if not all(isinstance(b, (int, float)) for b in bets):
-            logging.error(f"Некорректные ставки: {bets}")
-            bets = [0 if not isinstance(b, (int, float)) else b for b in bets]
-        if not all(isinstance(s, (int, float)) for s in stacks):
-            logging.error(f"Некорректные стеки: {stacks}")
-            stacks = [0 if not isinstance(s, (int, float)) else s for s in stacks]
-        my_stack = stacks[position]
-        pot = sum(bets)
-        if pot < 0 or my_stack < 0:
-            raise ValueError(f"Invalid pot ({pot}) or stack ({my_stack})")
-        aggression = np.mean([b[0] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
-        passivity = np.mean([b[1] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
-        big_blind = 2
-        min_raise = max(big_blind, pot * 0.5)
-        if hand_strength > 0.9:
-            bet = pot * 2.0
-        elif hand_strength < 0.2:
-            bet = pot * 0.25 if random.random() < 0.3 and position > 0 else 0
-        elif stage[3] and hand_strength < 0.4 and passivity > 0.6:
-            bet = 0
-        else:
-            bet = pot * {'tight': 0.5 if aggression < 0.3 else 0,
-                         'loose': 1.5,
-                         'aggressive': 2.0 if aggression > 0.5 else 1.0,
-                         'bluffer': 3.0 if random.random() > 0.7 else 0.5,
-                         'default': 0.75 + aggression,
-                         'passive': 0.25}.get(self.style, 0.75)
-        bet = max(min_raise, min(my_stack, bet))
-        bet = (bet // big_blind) * big_blind
-        logging.debug(f"Bet calculated: {bet} (pot={pot}, stack={my_stack}, style={self.style})")
-        return max(1, int(bet))
-
-    def adaptive_epsilon_decay(self, reward):
-        self.reward_buffer.append(reward)
-        self.total_updates += 1
-        if self.total_updates % 100 == 0:
-            recent_rewards = np.mean(self.reward_buffer)
-            self.epsilon = max(epsilon_end, self.epsilon * (0.99 if recent_rewards < 0 else 0.95))
-          
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         logging.debug(f"Step input: state type={type(state)}, state={state}")
         if not isinstance(state, dict):
             logging.error(f"State is not a dict: type={type(state)}, value={state}")
             raise ValueError(f"Invalid state format: expected dict, got {type(state)}")
-        legal_actions = list(state['legal_actions'].keys())
+        
+        # Исправление для legal_actions
+        if isinstance(state['legal_actions'], dict):
+            legal_actions = list(state['legal_actions'].keys())
+        elif isinstance(state['legal_actions'], (list, tuple)):
+            legal_actions = state['legal_actions']
+        else:
+            logging.error(f"Unexpected legal_actions type: {type(state['legal_actions'])}")
+            legal_actions = []
+
         player_cards, community_cards = extract_cards(state, stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
         processed_state = processor.process(state, position, active_players, bets, stacks, stage, opponent_behaviors)
@@ -422,7 +391,16 @@ def collect_experience(args):
             logging.warning(f"Initial state is not a list, assuming single-player state format: {type(state)}")
             state_warning_logged = True
         if isinstance(state, tuple):
-            state_dict = {'obs': state[0], 'legal_actions': state[1]}
+            # Исправление для преобразования legal_actions
+            obs_part = state[0]
+            legal_actions_part = state[1]
+            if isinstance(legal_actions_part, list):
+                from collections import OrderedDict
+                legal_actions_dict = OrderedDict({action: None for action in legal_actions_part})
+            else:
+                legal_actions_dict = legal_actions_part
+                
+            state_dict = {'obs': obs_part, 'legal_actions': legal_actions_dict}
             state = [state_dict] * env.num_players
         else:
             logging.error(f"Unexpected initial state type: {type(state)}, value={state}")
@@ -452,7 +430,16 @@ def collect_experience(args):
         
         if not isinstance(next_state, list):
             if isinstance(next_state, tuple):
-                next_state_dict = {'obs': next_state[0], 'legal_actions': next_state[1]}
+                # Повторяем исправление для next_state
+                next_obs_part = next_state[0]
+                next_legal_actions_part = next_state[1]
+                if isinstance(next_legal_actions_part, list):
+                    from collections import OrderedDict
+                    next_legal_actions_dict = OrderedDict({action: None for action in next_legal_actions_part})
+                else:
+                    next_legal_actions_dict = next_legal_actions_part
+                    
+                next_state_dict = {'obs': next_obs_part, 'legal_actions': next_legal_actions_dict}
                 next_state = [next_state_dict] * env.num_players
             else:
                 logging.error(f"Unexpected next_state type: {type(next_state)}, value={next_state}")
@@ -478,7 +465,16 @@ def collect_experience(args):
             state = env.reset()
             if not isinstance(state, list):
                 if isinstance(state, tuple):
-                    state_dict = {'obs': state[0], 'legal_actions': state[1]}
+                    # Повторяем исправление для reset state
+                    reset_obs_part = state[0]
+                    reset_legal_actions_part = state[1]
+                    if isinstance(reset_legal_actions_part, list):
+                        from collections import OrderedDict
+                        reset_legal_actions_dict = OrderedDict({action: None for action in reset_legal_actions_part})
+                    else:
+                        reset_legal_actions_dict = reset_legal_actions_part
+                        
+                    state_dict = {'obs': reset_obs_part, 'legal_actions': reset_legal_actions_dict}
                     state = [state_dict] * env.num_players
                 else:
                     logging.error(f"Unexpected reset state type: {type(state)}, value={state}")
