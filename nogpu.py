@@ -37,7 +37,7 @@ epsilon_end = 0.01
 target_update_freq = 1000
 buffer_capacity = 500_000
 num_workers = 4  # Уменьшено для CPU
-steps_per_worker = 1000
+steps_per_worker = 100
 selfplay_update_freq = 5000
 log_freq = 25
 test_interval = 2000
@@ -357,10 +357,11 @@ class CustomDQNAgent:
                 logging.error(f"State is not a dict: {type(state)}, value: {state}")
                 state = {'obs': np.zeros(82), 'legal_actions': OrderedDict({0: None, 1: None, 3: None, 4: None}), 'raw_obs': {}}
 
+            # Извлекаем legal_actions
             legal_actions = []
             if 'legal_actions' in state:
                 la = state['legal_actions']
-                if isinstance(la, dict):
+                if isinstance(la, dict) or isinstance(la, OrderedDict):
                     legal_actions = list(la.keys())
                 elif isinstance(la, (list, tuple)):
                     legal_actions = list(la)
@@ -395,6 +396,8 @@ class CustomDQNAgent:
                     q_values = self.model(state_tensor)
                     noise = torch.normal(0, noise_scale, q_values.shape).to(device)
                     q_values += noise
+                    # Дополнительная проверка перед индексацией
+                    logging.debug(f"legal_actions before indexing: {legal_actions}")
                     legal_q = q_values[0, legal_actions]
                     action_idx = torch.argmax(legal_q).item()
                     action = legal_actions[action_idx]
@@ -411,6 +414,7 @@ class CustomDQNAgent:
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         return self.step(state, position, active_players, bets, stacks, stage, opponent_behaviors), {}
+
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
     env, agents, processor, num_steps, device, table_id, hand_history, result_queue = args
@@ -438,6 +442,17 @@ def collect_experience(args):
                     'obs': obs_part,
                     'legal_actions': legal_actions_dict,
                     'raw_obs': obs_part
+                }
+                state = [state_dict] * env.num_players
+            elif isinstance(state, dict):
+                # Если state — это словарь, преобразуем его в список словарей
+                legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
+                if isinstance(legal_actions_dict, list):
+                    legal_actions_dict = OrderedDict((a, None) for a in legal_actions_dict)
+                state_dict = {
+                    'obs': state.get('obs', np.zeros(82)),
+                    'legal_actions': legal_actions_dict,
+                    'raw_obs': state.get('raw_obs', {})
                 }
                 state = [state_dict] * env.num_players
             else:
@@ -506,6 +521,16 @@ def collect_experience(args):
                         'legal_actions': next_legal_dict,
                         'raw_obs': next_obs
                     }] * env.num_players
+                elif isinstance(next_state, dict):
+                    # Если next_state — это словарь, преобразуем его в список словарей
+                    next_legal_dict = next_state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
+                    if isinstance(next_legal_dict, list):
+                        next_legal_dict = OrderedDict((a, None) for a in next_legal_dict)
+                    next_state = [{
+                        'obs': next_state.get('obs', np.zeros(82)),
+                        'legal_actions': next_legal_dict,
+                        'raw_obs': next_state.get('raw_obs', {})
+                    }] * env.num_players
                 else:
                     logging.error(f"Invalid next_state type: {type(next_state)}, value: {next_state}")
                     next_state = [state[player_id]] * env.num_players  # Используем старое состояние как запасной вариант
@@ -554,6 +579,16 @@ def collect_experience(args):
                             'raw_obs': obs_part
                         }
                         state = [state_dict] * env.num_players
+                    elif isinstance(state, dict):
+                        legal_actions_dict = state.get('legal_actions', OrderedDict({0: None, 1: None, 3: None, 4: None}))
+                        if isinstance(legal_actions_dict, list):
+                            legal_actions_dict = OrderedDict((a, None) for a in legal_actions_dict)
+                        state_dict = {
+                            'obs': state.get('obs', np.zeros(82)),
+                            'legal_actions': legal_actions_dict,
+                            'raw_obs': state.get('raw_obs', {})
+                        }
+                        state = [state_dict] * env.num_players
                     else:
                         logging.error(f"Invalid reset state type: {type(state)}, value: {state}")
                         state = [state[player_id]] * env.num_players
@@ -562,7 +597,6 @@ def collect_experience(args):
     except Exception as e:
         logging.error(f"Experience collection crashed: {str(e)}")
         result_queue.put(([], local_opponent_stats))
-
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
     total_reward = 0
