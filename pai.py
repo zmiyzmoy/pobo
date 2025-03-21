@@ -387,8 +387,14 @@ def collect_experience(args):
     experiences = []
     state = env.reset()
     
-    if not isinstance(state, list) or len(state) != env.num_players:
-        logging.error(f"Invalid state length: expected {env.num_players}, got {len(state) if isinstance(state, list) else 'not a list'}")
+    logging.debug(f"Initial state type: {type(state)}, num_players: {env.num_players}")
+    
+    if not isinstance(state, list):
+        logging.warning(f"State is not a list, assuming single-player state format: {type(state)}")
+        state = [state] * env.num_players
+    
+    if len(state) != env.num_players:
+        logging.error(f"Invalid state length: expected {env.num_players}, got {len(state)}")
         return [], local_opponent_stats
     
     num_players = len(env.game.players)
@@ -405,10 +411,14 @@ def collect_experience(args):
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
         next_state, reward, done, _ = env.step(action)
+        
+        if not isinstance(next_state, list):
+            next_state = [next_state] * env.num_players
+        
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
         player_cards, community_cards = extract_cards(state[player_id], stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
-        total_reward = reward[player_id]
+        total_reward = reward[player_id] if isinstance(reward, list) else reward
         hand_history.add(table_id, player_id, action, action if action > 1 else 0, hand_strength, stage, sum(bets))
         agents[player_id].adaptive_epsilon_decay(total_reward)
         experiences.append((
@@ -418,8 +428,10 @@ def collect_experience(args):
         state = next_state
         if done:
             state = env.reset()
-            if not isinstance(state, list) or len(state) != env.num_players:
-                logging.error(f"Invalid state length after reset: expected {env.num_players}, got {len(state) if isinstance(state, list) else 'not a list'}")
+            if not isinstance(state, list):
+                state = [state] * env.num_players
+            if len(state) != env.num_players:
+                logging.error(f"Invalid state length after reset: expected {env.num_players}, got {len(state)}")
                 break
     return experiences, local_opponent_stats
 
@@ -431,6 +443,8 @@ def tournament(env, num):
     num_players = len(env.game.players)
     for _ in range(num):
         state = env.reset()
+        if not isinstance(state, list):
+            state = [state] * env.num_players
         done = False
         while not done:
             player_id = env.timestep % env.num_players
@@ -442,8 +456,10 @@ def tournament(env, num):
             opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
             state, reward, done, _ = env.step(action)
+            if not isinstance(state, list):
+                state = [state] * env.num_players
             if player_id == 0:
-                total_reward += reward[player_id]
+                total_reward += reward[player_id] if isinstance(reward, list) else reward
                 if action == 0:
                     action_counts['fold'] += 1
                 elif action == 1:
@@ -535,6 +551,9 @@ class TrainingSession:
 
     def train(self):
         envs = [rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42 + i}) for i in range(num_tables)]
+        for i, env in enumerate(envs):
+            logging.debug(f"Env {i}: num_players={env.num_players}")
+        
         base_state_size = np.prod(envs[0].state_shape[0]) - 52 + 84
         extra_features = 2 + 6 + 6 + 4 + (5 * 3) + 2
         state_size = base_state_size + extra_features
@@ -550,7 +569,7 @@ class TrainingSession:
         hand_history = HandHistory()
 
         test_env = rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42})
-        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles]
+        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles[:6]]
         test_env.set_agents(test_agents)
 
         tracemalloc.start()
