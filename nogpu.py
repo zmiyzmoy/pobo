@@ -143,66 +143,32 @@ class PrioritizedExperienceBuffer:
         return len(self.buffer)
 
 # ========== ОБРАБОТКА КАРТ ==========
-class CardEmbedding(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.rank_embedding = nn.Embedding(14, 8)
-        self.suit_embedding = nn.Embedding(5, 4)
-        self.error_count = 0
-
-    def forward(self, cards):
-        try:
-            ranks = []
-            suits = []
-            for c in cards:
-                try:
-                    ranks.append(Card.get_rank_int(c))
-                    suits.append(Card.get_suit_int(c))
-                except:
-                    ranks.append(13)
-                    suits.append(4)
-            ranks = torch.LongTensor(ranks).to(device)
-            suits = torch.LongTensor(suits).to(device)
-            return torch.cat([self.rank_embedding(ranks), self.suit_embedding(suits)], dim=-1)
-        except Exception as e:
-            self.error_count += 1
-            logging.error(f"Critical embedding error #{self.error_count}: {str(e)}")
-            return torch.zeros((len(cards), 12)).to(device)
-
 @lru_cache(maxsize=500)
 def cached_evaluate(player_cards, community_cards):
     evaluator = Evaluator()
-    if not community_cards:
+    if not community_cards or len(player_cards) < 2:
         return 0.1
-    score = evaluator.evaluate(community_cards, player_cards)
-    return 1.0 - (score / 7462)
+    try:
+        score = evaluator.evaluate(community_cards, player_cards)
+        return 1.0 - (score / 7462)
+    except:
+        return 0.5
 
 def extract_cards(state_dict, stage):
     try:
-        if 'obs' not in state_dict or len(state_dict['obs']) < 52:
-            raise ValueError("Invalid state_dict structure or insufficient length")
-        obs = state_dict['obs']
-        hand = obs[:52].reshape(13, 4)
-        player_cards = np.where(hand == 1)
-        if player_cards[0].size < 2:
-            logging.warning("Less than 2 player cards detected")
+        if 'raw_obs' not in state_dict:
             return (), ()
-        player_cards = [Card.new(Card.print_pretty_cards([r * 4 + s])[0]) for r, s in zip(player_cards[0], player_cards[1])]
+            
+        raw_obs = state_dict['raw_obs']
+        player_cards = [Card.new(card) for card in raw_obs.get('hand', [])]
+        
         community_cards = []
-        if stage[1] and len(obs) >= 67:
-            community_cards = obs[52:52+15].reshape(5, 3)[:3]
-        elif stage[2] and len(obs) >= 72:
-            community_cards = obs[52:52+20].reshape(5, 4)[:4]
-        elif stage[3] and len(obs) >= 77:
-            community_cards = obs[52:52+25].reshape(5, 5)
-        if len(community_cards) > 0:
-            community_cards = np.where(community_cards == 1)
-            if community_cards[0].size == 0:
-                return tuple(player_cards), ()
-            community_cards = [Card.new(Card.print_pretty_cards([r * 4 + s])[0]) for r, s in zip(community_cards[0], community_cards[1])]
+        if 'public_cards' in raw_obs:
+            community_cards = [Card.new(card) for card in raw_obs['public_cards']]
+            
         return tuple(player_cards), tuple(community_cards)
     except Exception as e:
-        logging.error(f"Error in extract_cards: {e}")
+        logging.error(f"Error in extract_cards: {str(e)}")
         return (), ()
 
 # ========== ПОТОКОБЕЗОПАСНАЯ СТАТИСТИКА ОППОНЕНТОВ ==========
@@ -332,155 +298,206 @@ class CustomDQNAgent:
         self.total_updates = 0
         self.reward_buffer = collections.deque(maxlen=100)
         self.action_history = collections.deque(maxlen=5)
+        self.processor = StateProcessor(noise_intensity=0.0)
+
+    def dynamic_bet_size(self, stacks, bets, position, opponent_behaviors, hand_strength, stage):
+        try:
+            my_stack = stacks[position]
+            pot = sum(bets)
+            big_blind = 2
+            min_raise = max(big_blind, pot * 0.5)
+            
+            if hand_strength > 0.85:
+                bet = min(my_stack, pot * 2.5)
+            elif hand_strength < 0.3:
+                bet = 0 if random.random() < 0.7 else pot * 0.5
+            else:
+                base = pot * 0.75
+                aggression = np.mean([b[0] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
+                bet = base * (1 + aggression)
+                
+            return max(min_raise, int(bet // big_blind * big_blind))
+        except Exception as e:
+            logging.error(f"Bet calc error: {str(e)}")
+            return 2
+
+    def adaptive_epsilon_decay(self, reward):
+        self.reward_buffer.append(reward)
+        self.total_updates += 1
+        if self.total_updates % 100 == 0:
+            recent_avg = np.mean(self.reward_buffer)
+            decay_factor = 0.98 if recent_avg < 0 else 0.95
+            self.epsilon = max(epsilon_end, self.epsilon * decay_factor)
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
-        logging.debug(f"Step input: state type={type(state)}, state={state}")
-        if not isinstance(state, dict):
-            logging.error(f"State is not a dict: type={type(state)}, value={state}")
-            raise ValueError(f"Invalid state format: expected dict, got {type(state)}")
-        
-        # Исправление для legal_actions
-        if isinstance(state['legal_actions'], dict):
-            legal_actions = list(state['legal_actions'].keys())
-        elif isinstance(state['legal_actions'], (list, tuple)):
-            legal_actions = state['legal_actions']
-        else:
-            logging.error(f"Unexpected legal_actions type: {type(state['legal_actions'])}")
+        try:
+            # Обработка legal_actions
             legal_actions = []
+            if isinstance(state, dict):
+                if 'legal_actions' in state:
+                    la = state['legal_actions']
+                    if isinstance(la, dict):
+                        legal_actions = list(la.keys())
+                    elif isinstance(la, (list, tuple)):
+                        legal_actions = la
+                    elif isinstance(la, int):
+                        legal_actions = [la]
+                
+            if not legal_actions:
+                legal_actions = [0, 1, 3, 4]
 
-        player_cards, community_cards = extract_cards(state, stage)
-        hand_strength = cached_evaluate(player_cards, community_cards)
-        processed_state = processor.process(state, position, active_players, bets, stacks, stage, opponent_behaviors)
-        state_tensor = torch.FloatTensor(processed_state).to(device).unsqueeze(0)
+            # Обработка состояния
+            processed_state = self.processor.process(
+                state, position, active_players, 
+                bets, stacks, stage, opponent_behaviors
+            )
+            state_tensor = torch.FloatTensor(processed_state).to(device).unsqueeze(0)
 
-        if np.random.rand() < self.epsilon:
-            action = random.choice(legal_actions)
-            if action > 1:
-                action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-            self.action_history.append(action)
-            logging.debug(f"Random action chosen: {action}")
-        else:
-            with torch.no_grad():
-                q_values = self.model(state_tensor)
-                noise = torch.normal(0, noise_scale, q_values.shape).to(device)
-                q_values += noise
-                q_values_legal = q_values[0, legal_actions]
-                action_idx = torch.argmax(q_values_legal).item()
-                action = legal_actions[action_idx]
+            # Выбор действия
+            if np.random.rand() < self.epsilon:
+                action = random.choice(legal_actions)
                 if action > 1:
+                    player_cards, community_cards = extract_cards(state, stage)
+                    hand_strength = cached_evaluate(player_cards, community_cards)
                     action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
-                self.action_history.append(action)
-                logging.debug(f"Q-value action chosen: {action}")
-        
-        logging.debug(f"Returning action: {action}")
-        return action
+            else:
+                with torch.no_grad():
+                    q_values = self.model(state_tensor)
+                    noise = torch.normal(0, noise_scale, q_values.shape).to(device)
+                    q_values += noise
+                    legal_q = q_values[0, legal_actions]
+                    action_idx = torch.argmax(legal_q).item()
+                    action = legal_actions[action_idx]
+                    if action > 1:
+                        player_cards, community_cards = extract_cards(state, stage)
+                        hand_strength = cached_evaluate(player_cards, community_cards)
+                        action = self.dynamic_bet_size(stacks, bets, position, opponent_behaviors, hand_strength, stage)
+
+            self.action_history.append(action)
+            return action
+        except Exception as e:
+            logging.error(f"Agent step failed: {str(e)}")
+            return 0
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         return self.step(state, position, active_players, bets, stacks, stage, opponent_behaviors), {}
+
 
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
     env, agents, processor, num_steps, device, table_id, hand_history = args
     local_opponent_stats = SharedOpponentStats()
     experiences = []
-    state = env.reset()
-    state_warning_logged = False
     
-    if not isinstance(state, list):
-        if not state_warning_logged:
-            logging.warning(f"Initial state is not a list, assuming single-player state format: {type(state)}")
-            state_warning_logged = True
-        if isinstance(state, tuple):
-            # Исправление для преобразования legal_actions
-            obs_part = state[0]
-            legal_actions_part = state[1]
-            if isinstance(legal_actions_part, list):
-                from collections import OrderedDict
-                legal_actions_dict = OrderedDict({action: None for action in legal_actions_part})
-            else:
-                legal_actions_dict = legal_actions_part
+    try:
+        state = env.reset()
+        state_warning_logged = False
+        
+        # Преобразование начального состояния
+        if not isinstance(state, list):
+            if isinstance(state, tuple):
+                obs_part = state[0]
+                legal_actions_part = state[1]
                 
-            state_dict = {'obs': obs_part, 'legal_actions': legal_actions_dict}
-            state = [state_dict] * env.num_players
-        else:
-            logging.error(f"Unexpected initial state type: {type(state)}, value={state}")
-            return [], local_opponent_stats
-    
-    num_players_actual = len(env.game.players)
-    if num_players_actual != env.num_players:
-        logging.error(f"Player count mismatch: env.num_players={env.num_players}, actual={num_players_actual}")
-        return [], local_opponent_stats
-    
-    for step_idx in range(num_steps):
-        player_id = env.timestep % len(agents)
-        position = env.game.get_player_id()
-        active_players = len([p for p in env.game.players if p.status == 'alive'])
-        bets = [env.game.players[i].in_chips if i < num_players_actual and env.game.players[i].status == 'alive' else 0 for i in range(num_players)]
-        stacks = [p.remained_chips if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]
-        stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
-        
-        logging.debug(f"Before agent step: player_id={player_id}, state={state[player_id]}")
-        action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
-        
-        logging.debug(f"Before env.step: action={action}, state={state[player_id]}")
-        next_state, reward, done, info = env.step(action)
-        
-        logging.debug(f"Step {step_idx}: action={action}, next_state type={type(next_state)}, next_state={next_state}, reward={reward}, done={done}, info={info}")
-        
-        if not isinstance(next_state, list):
-            if isinstance(next_state, tuple):
-                # Повторяем исправление для next_state
-                next_obs_part = next_state[0]
-                next_legal_actions_part = next_state[1]
-                if isinstance(next_legal_actions_part, list):
-                    from collections import OrderedDict
-                    next_legal_actions_dict = OrderedDict({action: None for action in next_legal_actions_part})
+                # Преобразование legal_actions
+                if isinstance(legal_actions_part, int):
+                    legal_actions_dict = OrderedDict({legal_actions_part: None})
+                elif isinstance(legal_actions_part, (list, tuple)):
+                    legal_actions_dict = OrderedDict((a, None) for a in legal_actions_part)
                 else:
-                    next_legal_actions_dict = next_legal_actions_part
+                    legal_actions_dict = legal_actions_part
                     
-                next_state_dict = {'obs': next_obs_part, 'legal_actions': next_legal_actions_dict}
-                next_state = [next_state_dict] * env.num_players
+                state_dict = {
+                    'obs': obs_part,
+                    'legal_actions': legal_actions_dict,
+                    'raw_obs': obs_part
+                }
+                state = [state_dict] * env.num_players
             else:
-                logging.error(f"Unexpected next_state type: {type(next_state)}, value={next_state}")
+                logging.error(f"Invalid initial state type: {type(state)}")
                 return [], local_opponent_stats
-        
-        logging.debug(f"After next_state conversion: next_state={next_state}")
-        
-        local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
-        player_cards, community_cards = extract_cards(state[player_id], stage)
-        hand_strength = cached_evaluate(player_cards, community_cards)
-        total_reward = reward[player_id] if isinstance(reward, list) else reward
-        hand_history.add(table_id, player_id, action, action if action > 1 else 0, hand_strength, stage, sum(bets))
-        agents[player_id].adaptive_epsilon_decay(total_reward)
-        experiences.append((
-            state[player_id], action, total_reward, next_state[player_id], done,
-            position, active_players, bets, stacks, stage, opponent_behaviors
-        ))
-        
-        state = next_state
-        logging.debug(f"After state update: state={state}, player_id={player_id}, state[player_id]={state[player_id]}")
-        
-        if done:
-            state = env.reset()
-            if not isinstance(state, list):
-                if isinstance(state, tuple):
-                    # Повторяем исправление для reset state
-                    reset_obs_part = state[0]
-                    reset_legal_actions_part = state[1]
-                    if isinstance(reset_legal_actions_part, list):
-                        from collections import OrderedDict
-                        reset_legal_actions_dict = OrderedDict({action: None for action in reset_legal_actions_part})
-                    else:
-                        reset_legal_actions_dict = reset_legal_actions_part
-                        
-                    state_dict = {'obs': reset_obs_part, 'legal_actions': reset_legal_actions_dict}
-                    state = [state_dict] * env.num_players
+
+        for step_idx in range(num_steps):
+            player_id = env.timestep % env.num_players
+            position = env.game.get_player_id()
+            active_players = len([p for p in env.game.players if p.status == 'alive'])
+            
+            # Получение ставок и стеков
+            bets = []
+            stacks = []
+            for i in range(env.num_players):
+                if i < len(env.game.players):
+                    bets.append(env.game.players[i].in_chips if env.game.players[i].status == 'alive' else 0)
+                    stacks.append(env.game.players[i].remained_chips)
                 else:
-                    logging.error(f"Unexpected reset state type: {type(state)}, value={state}")
-                    return [], local_opponent_stats
-    
-    return experiences, local_opponent_stats
+                    bets.append(0)
+                    stacks.append(0)
+            
+            stage = [int(env.game.round_counter == i) for i in range(4)]
+            opponent_behaviors = np.array([
+                local_opponent_stats.get_behavior(i, stage) 
+                for i in range(env.num_players) 
+                if i != player_id
+            ])
+            
+            # Выбор действия
+            action = agents[player_id].step(
+                state[player_id], 
+                position, 
+                active_players,
+                bets,
+                stacks,
+                stage,
+                opponent_behaviors
+            )
+            
+            # Шаг среды
+            next_state, reward, done, _ = env.step(action)
+            
+            # Преобразование next_state
+            if not isinstance(next_state, list):
+                if isinstance(next_state, tuple):
+                    next_obs = next_state[0]
+                    next_legal = next_state[1]
+                    
+                    if isinstance(next_legal, int):
+                        next_legal_dict = OrderedDict({next_legal: None})
+                    elif isinstance(next_legal, (list, tuple)):
+                        next_legal_dict = OrderedDict((a, None) for a in next_legal)
+                    else:
+                        next_legal_dict = next_legal
+                        
+                    next_state = [{
+                        'obs': next_obs,
+                        'legal_actions': next_legal_dict,
+                        'raw_obs': next_obs
+                    }] * env.num_players
+            
+            # Сохранение опыта
+            experiences.append((
+                state[player_id],
+                action,
+                reward[player_id] if isinstance(reward, list) else reward,
+                next_state[player_id],
+                done,
+                position,
+                active_players,
+                bets,
+                stacks,
+                stage,
+                opponent_behaviors
+            ))
+            
+            state = next_state
+            
+            if done:
+                state = env.reset()
+
+        return experiences, local_opponent_stats
+    except Exception as e:
+        logging.error(f"Experience collection crashed: {str(e)}")
+        return [], local_opponent_stats
+
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
     total_reward = 0
