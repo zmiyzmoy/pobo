@@ -352,28 +352,29 @@ class CustomDQNAgent:
 
     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         try:
+            # Проверяем, что state — это словарь
+            if not isinstance(state, dict):
+                logging.error(f"State is not a dict: {type(state)}, value: {state}")
+                state = {'obs': np.zeros(82), 'legal_actions': OrderedDict({0: None, 1: None, 3: None, 4: None}), 'raw_obs': {}}
+
             legal_actions = []
-            if isinstance(state, dict):
-                if 'legal_actions' in state:
-                    la = state['legal_actions']
-                    if isinstance(la, dict):
-                        legal_actions = list(la.keys())
-                    elif isinstance(la, (list, tuple)):
-                        legal_actions = list(la)
-                    elif isinstance(la, int):
-                        legal_actions = [la]
-                    else:
-                        logging.warning(f"Unexpected legal_actions type: {type(la)}, value: {la}")
-                        legal_actions = [0, 1, 3, 4]
+            if 'legal_actions' in state:
+                la = state['legal_actions']
+                if isinstance(la, dict):
+                    legal_actions = list(la.keys())
+                elif isinstance(la, (list, tuple)):
+                    legal_actions = list(la)
+                elif isinstance(la, int):
+                    legal_actions = [la]
+                else:
+                    logging.warning(f"Unexpected legal_actions type: {type(la)}, value: {la}")
+                    legal_actions = [0, 1, 3, 4]
             else:
-                logging.warning(f"State is not a dict: {type(state)}, value: {state}")
-            
-            if not legal_actions:
-                logging.info("No legal actions found, using default: [0, 1, 3, 4]")
+                logging.warning(f"No 'legal_actions' in state: {state}")
                 legal_actions = [0, 1, 3, 4]
 
             # Проверяем, что legal_actions содержит только целые числа
-            if not all(isinstance(a, (int, np.integer)) for a in legal_actions):
+            if not legal_actions or not all(isinstance(a, (int, np.integer)) for a in legal_actions):
                 logging.error(f"Invalid legal_actions: {legal_actions}")
                 legal_actions = [0, 1, 3, 4]
 
@@ -410,7 +411,6 @@ class CustomDQNAgent:
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         return self.step(state, position, active_players, bets, stacks, stage, opponent_behaviors), {}
-
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
     env, agents, processor, num_steps, device, table_id, hand_history, result_queue = args
@@ -419,8 +419,8 @@ def collect_experience(args):
     
     try:
         state = env.reset()
-        state_warning_logged = False
         
+        # Проверяем, что state корректный
         if not isinstance(state, list):
             if isinstance(state, tuple):
                 obs_part = state[0]
@@ -431,8 +431,9 @@ def collect_experience(args):
                 elif isinstance(legal_actions_part, (list, tuple)):
                     legal_actions_dict = OrderedDict((a, None) for a in legal_actions_part)
                 else:
-                    legal_actions_dict = legal_actions_part
-                    
+                    legal_actions_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
+                    logging.warning(f"Unexpected legal_actions_part type in initial state: {type(legal_actions_part)}, value: {legal_actions_part}")
+                
                 state_dict = {
                     'obs': obs_part,
                     'legal_actions': legal_actions_dict,
@@ -440,7 +441,7 @@ def collect_experience(args):
                 }
                 state = [state_dict] * env.num_players
             else:
-                logging.error(f"Invalid initial state type: {type(state)}")
+                logging.error(f"Invalid initial state type: {type(state)}, value: {state}")
                 result_queue.put(([], local_opponent_stats))
                 return
 
@@ -466,6 +467,9 @@ def collect_experience(args):
                 if i != player_id
             ])
             
+            # Логируем state перед вызовом step
+            logging.debug(f"State before step for player {player_id}: {state[player_id]}")
+            
             action = agents[player_id].step(
                 state[player_id], 
                 position, 
@@ -480,6 +484,10 @@ def collect_experience(args):
             reward = 0  # Временное значение
             done = False  # Временное значение
             
+            # Логируем next_state после env.step
+            logging.debug(f"Next state after step: {next_state}")
+            
+            # Проверяем, что next_state корректный
             if not isinstance(next_state, list):
                 if isinstance(next_state, tuple):
                     next_obs = next_state[0]
@@ -490,13 +498,17 @@ def collect_experience(args):
                     elif isinstance(next_legal, (list, tuple)):
                         next_legal_dict = OrderedDict((a, None) for a in next_legal)
                     else:
-                        next_legal_dict = next_legal
+                        next_legal_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
+                        logging.warning(f"Unexpected next_legal type: {type(next_legal)}, value: {next_legal}")
                         
                     next_state = [{
                         'obs': next_obs,
                         'legal_actions': next_legal_dict,
                         'raw_obs': next_obs
                     }] * env.num_players
+                else:
+                    logging.error(f"Invalid next_state type: {type(next_state)}, value: {next_state}")
+                    next_state = [state[player_id]] * env.num_players  # Используем старое состояние как запасной вариант
             
             total_reward = reward
             local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
@@ -533,7 +545,8 @@ def collect_experience(args):
                         elif isinstance(legal_actions_part, (list, tuple)):
                             legal_actions_dict = OrderedDict((a, None) for a in legal_actions_part)
                         else:
-                            legal_actions_dict = legal_actions_part
+                            legal_actions_dict = OrderedDict({0: None, 1: None, 3: None, 4: None})
+                            logging.warning(f"Unexpected legal_actions_part type after reset: {type(legal_actions_part)}, value: {legal_actions_part}")
                             
                         state_dict = {
                             'obs': obs_part,
@@ -541,6 +554,9 @@ def collect_experience(args):
                             'raw_obs': obs_part
                         }
                         state = [state_dict] * env.num_players
+                    else:
+                        logging.error(f"Invalid reset state type: {type(state)}, value: {state}")
+                        state = [state[player_id]] * env.num_players
 
         result_queue.put((experiences, local_opponent_stats))
     except Exception as e:
@@ -552,7 +568,13 @@ def tournament(env, num):
     total_reward = 0
     action_counts = {'fold': 0, 'call': 0, 'raise': 0}
     total_actions = 0
-    num_players_actual = len(env.game.players)
+    # Проверяем, что env.game.players не равно None
+    if env.game.players is None:
+        logging.error("env.game.players is None, initializing default players")
+        num_players_actual = env.num_players
+    else:
+        num_players_actual = len(env.game.players)
+    
     for _ in range(num):
         state = env.reset()
         if not isinstance(state, list):
