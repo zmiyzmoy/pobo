@@ -47,7 +47,8 @@ early_stop_threshold = 0.001
 learning_rate = 1e-4
 noise_scale = 0.1
 num_tables = 2
-code_version = "v1.8"
+num_players = 2  # Временно уменьшено до 2 из-за ограничений RLCard
+code_version = "v1.9"
 grad_clip_value = 5.0
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -202,12 +203,12 @@ def extract_cards(state_dict, stage):
 # ========== ПОТОКОБЕЗОПАСНАЯ СТАТИСТИКА ОППОНЕНТОВ ==========
 class SharedOpponentStats:
     def __init__(self):
-        self.stats = [[0] * 16 for _ in range(6)]
+        self.stats = [[0] * 16 for _ in range(num_players)]
         self.lock = Lock()
         self._initialize()
 
     def _initialize(self):
-        for pid in range(6):
+        for pid in range(num_players):
             for stage in range(4):
                 for metric in range(4):
                     self.stats[pid][stage * 4 + metric] = 0
@@ -236,7 +237,7 @@ class SharedOpponentStats:
 
     def merge(self, other_stats):
         with self.lock:
-            for pid in range(6):
+            for pid in range(num_players):
                 for i in range(16):
                     self.stats[pid][i] += other_stats.stats[pid][i]
 
@@ -272,17 +273,17 @@ class StateProcessor:
         m_factor = stacks[position] / (pot / active_players) if active_players > 0 else 10.0
         pot_odds = my_bet / (pot + my_bet) if pot + my_bet > 0 else 0.0
         fold_equity = np.mean([b[1] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
-        pos_feature = position / 5.0
+        pos_feature = position / (num_players - 1)
         table_agg = np.mean([b[0] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
         table_fold = np.mean([b[1] for b in opponent_behaviors]) if opponent_behaviors.size else 0.5
         bets_feature = torch.FloatTensor(bets).to(device) / 1000.0
         stacks_feature = torch.FloatTensor(stacks).to(device) / 1000.0
         stage_feature = torch.FloatTensor(stage).to(device)
-        opponent_features = torch.FloatTensor(opponent_behaviors).flatten() if opponent_behaviors.size else torch.zeros(15).to(device)
+        opponent_features = torch.FloatTensor(opponent_behaviors).flatten() if opponent_behaviors.size else torch.zeros((num_players - 1) * 3).to(device)
         processed = torch.cat([
             obs,
             card_emb,
-            torch.tensor([pos_feature, active_players / 6.0, spr, m_factor, pot_odds, fold_equity], device=device),
+            torch.tensor([pos_feature, active_players / num_players, spr, m_factor, pot_odds, fold_equity], device=device),
             bets_feature,
             stacks_feature,
             stage_feature,
@@ -345,7 +346,7 @@ class CustomDQNAgent:
         if hand_strength > 0.9:
             bet = pot * 2.0
         elif hand_strength < 0.2:
-            bet = pot * 0.25 if random.random() < 0.3 and position > 3 else 0
+            bet = pot * 0.25 if random.random() < 0.3 and position > 0 else 0
         elif stage[3] and hand_strength < 0.4 and passivity > 0.6:
             bet = 0
         else:
@@ -406,30 +407,31 @@ def collect_experience(args):
     local_opponent_stats = SharedOpponentStats()
     experiences = []
     state = env.reset()
-    
-    logging.debug(f"Initial state type: {type(state)}, num_players: {env.num_players}")
+    state_warning_logged = False
     
     if not isinstance(state, list):
-        logging.warning(f"State is not a list, assuming single-player state format: {type(state)}")
+        if not state_warning_logged:
+            logging.warning(f"State is not a list, assuming single-player state format: {type(state)}")
+            state_warning_logged = True
         if isinstance(state, tuple):
             state_dict = {'obs': state[0], 'legal_actions': state[1]}
             state = [state_dict] * env.num_players
         else:
             state = [state] * env.num_players
     
-    num_players = len(env.game.players)
-    if num_players != env.num_players:
-        logging.error(f"Player count mismatch: env.num_players={env.num_players}, actual={num_players}")
+    num_players_actual = len(env.game.players)
+    if num_players_actual != env.num_players:
+        logging.error(f"Player count mismatch: env.num_players={env.num_players}, actual={num_players_actual}")
         return [], local_opponent_stats
     
     for _ in range(num_steps):
         player_id = env.timestep % len(agents)
         position = env.game.get_player_id()
-        active_players = len([p for p in env.game.players if p.status != 'folded'])
-        bets = [env.game.players[i].in_chips if i < num_players and env.game.players[i].status != 'folded' else 0 for i in range(6)]
-        stacks = [p.chips for p in env.game.players] + [0] * (6 - num_players)
+        active_players = len([p for p in env.game.players if p.status == 'alive'])
+        bets = [env.game.players[i].in_chips if i < num_players_actual and env.game.players[i].status == 'alive' else 0 for i in range(num_players)]
+        stacks = [p.remain_chips for p in env.game.players] + [0] * (num_players - num_players_actual)
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
+        opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
         next_state, reward, done, _ = env.step(action)
         
@@ -466,7 +468,7 @@ def tournament(env, num):
     total_reward = 0
     action_counts = {'fold': 0, 'call': 0, 'raise': 0}
     total_actions = 0
-    num_players = len(env.game.players)
+    num_players_actual = len(env.game.players)
     for _ in range(num):
         state = env.reset()
         if not isinstance(state, list):
@@ -479,11 +481,11 @@ def tournament(env, num):
         while not done:
             player_id = env.timestep % env.num_players
             position = env.game.get_player_id()
-            active_players = len([p for p in env.game.players if p.status != 'folded'])
-            bets = [env.game.players[i].in_chips if i < num_players and env.game.players[i].status != 'folded' else 0 for i in range(6)]
-            stacks = [p.chips for p in env.game.players] + [0] * (6 - num_players)
+            active_players = len([p for p in env.game.players if p.status == 'alive'])
+            bets = [env.game.players[i].in_chips if i < num_players_actual and env.game.players[i].status == 'alive' else 0 for i in range(num_players)]
+            stacks = [p.remain_chips for p in env.game.players] + [0] * (num_players - num_players_actual)
             stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
-            opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
+            opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
             state, reward, done, _ = env.step(action)
             if not isinstance(state, list):
@@ -521,7 +523,7 @@ class TrainingSession:
         self.target_model = DuelingPokerNN(input_size, num_actions).to(device)
         self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=500, verbose=True)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=500)
 
     def train_epoch(self, buffer, episode):
         batch, indices, weights = buffer.sample(batch_size)
@@ -589,28 +591,28 @@ class TrainingSession:
         self.opponent_stats.stats = checkpoint['stats']
 
     def train(self):
-        envs = [rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42 + i}) for i in range(num_tables)]
+        envs = [rlcard.make('no-limit-holdem', config={'num_players': num_players, 'seed': 42 + i}) for i in range(num_tables)]
         for i, env in enumerate(envs):
             logging.info(f"Env {i}: num_players={env.num_players}, state_shape={env.state_shape}")
-            if env.num_players != 6:
-                logging.warning(f"Environment {i} initialized with {env.num_players} players instead of 6")
+            if env.num_players != num_players:
+                logging.warning(f"Environment {i} initialized with {env.num_players} players instead of {num_players}")
         
         base_state_size = np.prod(envs[0].state_shape[0]) - 52 + 84
-        extra_features = 2 + 6 + 6 + 4 + (5 * 3) + 2
+        extra_features = 2 + num_players + num_players + 4 + ((num_players - 1) * 3) + 2
         state_size = base_state_size + extra_features
         num_actions = envs[0].num_actions
         self.initialize_models(state_size, num_actions)
 
         agent_styles = ['tight', 'loose', 'aggressive', 'bluffer', 'default', 'passive']
-        agents_per_table = [[CustomDQNAgent(self.model, s) for s in agent_styles[:min(6, envs[i].num_players)]] for i in range(num_tables)]
+        agents_per_table = [[CustomDQNAgent(self.model, s) for s in agent_styles[:min(num_players, envs[i].num_players)]] for i in range(num_tables)]
         for env, agents in zip(envs, agents_per_table):
             env.set_agents(agents)
 
         buffer = PrioritizedExperienceBuffer()
         hand_history = HandHistory()
 
-        test_env = rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42})
-        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles[:min(6, test_env.num_players)]]
+        test_env = rlcard.make('no-limit-holdem', config={'num_players': num_players, 'seed': 42})
+        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles[:min(num_players, test_env.num_players)]]
         test_env.set_agents(test_agents)
 
         tracemalloc.start()
@@ -652,12 +654,13 @@ class TrainingSession:
             if episode % log_freq == 0 and len(losses) > 0:
                 avg_loss = np.mean(losses)
                 epsilon_val = agents_per_table[0][0].epsilon
+                current_lr = self.optimizer.param_groups[0]['lr']
                 gpu_mem = torch.cuda.memory_allocated(device) / 1024**3 if torch.cuda.is_available() else 0
                 folds_strong, bluffs_weak = hand_history.analyze_errors()
                 cache_size = cached_evaluate.cache_info().currsize
                 logging.info(f"Episode {episode} | Avg Loss: {avg_loss:.4f} | Epsilon: {epsilon_val:.4f} | "
-                             f"Total Hands: {total_hands} | Folds Strong: {folds_strong:.2f} | Bluffs Weak: {bluffs_weak:.2f} | "
-                             f"GPU Mem: {gpu_mem:.2f} GB | Cache Size: {cache_size}")
+                             f"LR: {current_lr:.2e} | Total Hands: {total_hands} | Folds Strong: {folds_strong:.2f} | "
+                             f"Bluffs Weak: {bluffs_weak:.2f} | GPU Mem: {gpu_mem:.2f} GB | Cache Size: {cache_size}")
                 writer.add_scalar('Loss/Avg', avg_loss, episode)
                 writer.add_scalar('Epsilon', epsilon_val, episode)
                 writer.add_scalar('Hands/Total', total_hands, episode)
