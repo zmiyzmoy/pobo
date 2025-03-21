@@ -183,7 +183,24 @@ def extract_cards(state_dict, stage):
                 logging.error(f"Invalid card format in player_cards: {card}")
                 continue
             try:
-                card_int = Card.new(card)  # Преобразуем в формат treys
+                # Исправление: Убедимся, что формат карты соответствует ожидаемому в treys
+                # RLCard использует формат 'SJ' (валет пик), но treys ожидает 'Js'
+                # Преобразуем масть: S -> s, H -> h, D -> d, C -> c
+                # Преобразуем ранг: J -> j, Q -> q, K -> k, A -> a, 10 -> t
+                suit = card[0].lower()  # Масть: S -> s, H -> h, D -> d, C -> c
+                rank = card[1:]  # Ранг: J, Q, K, A или число
+                if rank == 'J':
+                    rank = 'j'
+                elif rank == 'Q':
+                    rank = 'q'
+                elif rank == 'K':
+                    rank = 'k'
+                elif rank == 'A':
+                    rank = 'a'
+                elif rank == '10':
+                    rank = 't'
+                treys_card = f"{rank}{suit}"  # Формат для treys: 'Js' вместо 'SJ'
+                card_int = Card.new(treys_card)  # Преобразуем в формат treys
                 player_cards_converted.append(card_int)
             except Exception as e:
                 logging.error(f"Failed to convert player card {card}: {str(e)}")
@@ -195,7 +212,21 @@ def extract_cards(state_dict, stage):
                 logging.error(f"Invalid card format in community_cards: {card}")
                 continue
             try:
-                card_int = Card.new(card)  # Преобразуем в формат treys
+                # Аналогичное преобразование для общих карт
+                suit = card[0].lower()
+                rank = card[1:]
+                if rank == 'J':
+                    rank = 'j'
+                elif rank == 'Q':
+                    rank = 'q'
+                elif rank == 'K':
+                    rank = 'k'
+                elif rank == 'A':
+                    rank = 'a'
+                elif rank == '10':
+                    rank = 't'
+                treys_card = f"{rank}{suit}"
+                card_int = Card.new(treys_card)
                 community_cards_converted.append(card_int)
             except Exception as e:
                 logging.error(f"Failed to convert community card {card}: {str(e)}")
@@ -206,7 +237,6 @@ def extract_cards(state_dict, stage):
     except Exception as e:
         logging.error(f"Error in extract_cards: {str(e)}")
         return (), ()
-
 # ========== EMBEDDING КАРТ ==========
 class CardEmbedding(nn.Module):
     def __init__(self):
@@ -426,6 +456,11 @@ class CustomDQNAgent:
 
             logging.debug(f"Processed legal_actions: {legal_actions}")
 
+            # Исправление: Преобразуем state['obs'] в список, чтобы избежать проблем со срезами
+            if 'obs' in state and isinstance(state['obs'], np.ndarray):
+                state['obs'] = state['obs'].tolist()
+                logging.debug(f"Converted state['obs'] to list to avoid slice issues: {state['obs'][:10]}")
+
             processed_state = self.processor.process(
                 state, position, active_players, 
                 bets, stacks, stage, opponent_behaviors
@@ -461,7 +496,6 @@ class CustomDQNAgent:
 
     def eval_step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         return self.step(state, position, active_players, bets, stacks, stage, opponent_behaviors), {}
-
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
     env, agents, processor, num_steps, device, table_id, hand_history, result_queue = args
