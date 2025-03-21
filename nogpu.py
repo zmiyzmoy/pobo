@@ -642,7 +642,7 @@ class TrainingSession:
         for episode in range(num_episodes):
             with Pool(processes=num_workers) as pool:
                 env_args = [
-                    (envs[i % num_tables], agents_per_table[i % num_tables], self.processor, steps_per_worker, device, i % num_tables, hand_history)
+                    (envs[i % num_tables], agents_per_table[i % num_tables], self.processor, s_per_worker, device, i % num_tables, hand_history)
                     for i in range(num_workers)
                 ]
                 results = pool.map(collect_experience, env_args)
