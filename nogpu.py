@@ -424,7 +424,7 @@ def collect_experience(args):
         position = env.game.get_player_id()
         active_players = len([p for p in env.game.players if p.status == 'alive'])
         bets = [env.game.players[i].in_chips if i < num_players_actual and env.game.players[i].status == 'alive' else 0 for i in range(num_players)]
-        stacks = [(p.chips - p.in_chips) if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]  # Исправлено
+        stacks = [p.remained_chips if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]  # Исправлено
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
@@ -478,7 +478,7 @@ def tournament(env, num):
             position = env.game.get_player_id()
             active_players = len([p for p in env.game.players if p.status == 'alive'])
             bets = [env.game.players[i].in_chips if i < num_players_actual and env.game.players[i].status == 'alive' else 0 for i in range(num_players)]
-            stacks = [(p.chips - p.in_chips) if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]  # Исправлено
+            stacks = [p.remained_chips if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]  # Исправлено
             stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
             opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
@@ -501,7 +501,6 @@ def tournament(env, num):
     winrate = total_reward / num
     action_freq = {k: v / total_actions if total_actions > 0 else 0 for k, v in action_counts.items()}
     return winrate, action_freq
-
 # ========== СЕССИЯ ОБУЧЕНИЯ ==========
 class TrainingSession:
     def __init__(self):
