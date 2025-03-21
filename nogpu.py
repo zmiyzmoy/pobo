@@ -1,3 +1,4 @@
+from multiprocessing import Process, Queue
 import os
 import logging
 
@@ -415,7 +416,7 @@ class CustomDQNAgent:
 
 # ========== ПАРАЛЛЕЛЬНЫЙ СБОР ДАННЫХ ==========
 def collect_experience(args):
-    env, agents, processor, num_steps, device, table_id, hand_history = args
+    env, agents, processor, num_steps, device, table_id, hand_history, result_queue = args
     local_opponent_stats = SharedOpponentStats()
     experiences = []
     
@@ -423,13 +424,11 @@ def collect_experience(args):
         state = env.reset()
         state_warning_logged = False
         
-        # Преобразование начального состояния
         if not isinstance(state, list):
             if isinstance(state, tuple):
                 obs_part = state[0]
                 legal_actions_part = state[1]
                 
-                # Преобразование legal_actions
                 if isinstance(legal_actions_part, int):
                     legal_actions_dict = OrderedDict({legal_actions_part: None})
                 elif isinstance(legal_actions_part, (list, tuple)):
@@ -445,14 +444,14 @@ def collect_experience(args):
                 state = [state_dict] * env.num_players
             else:
                 logging.error(f"Invalid initial state type: {type(state)}")
-                return [], local_opponent_stats
+                result_queue.put(([], local_opponent_stats))
+                return
 
         for step_idx in range(num_steps):
             player_id = env.timestep % env.num_players
             position = env.game.get_player_id()
             active_players = len([p for p in env.game.players if p.status == 'alive'])
             
-            # Получение ставок и стеков
             bets = []
             stacks = []
             for i in range(env.num_players):
@@ -469,6 +468,63 @@ def collect_experience(args):
                 for i in range(env.num_players) 
                 if i != player_id
             ])
+            
+            action = agents[player_id].step(
+                state[player_id], 
+                position, 
+                active_players,
+                bets,
+                stacks,
+                stage,
+                opponent_behaviors
+            )
+            
+            next_state, player_id = env.step(action)
+            reward = 0  # Временное значение
+            done = False  # Временное значение
+            
+            if not isinstance(next_state, list):
+                if isinstance(next_state, tuple):
+                    next_obs = next_state[0]
+                    next_legal = next_state[1]
+                    
+                    if isinstance(next_legal, int):
+                        next_legal_dict = OrderedDict({next_legal: None})
+                    elif isinstance(next_legal, (list, tuple)):
+                        next_legal_dict = OrderedDict((a, None) for a in next_legal)
+                    else:
+                        next_legal_dict = next_legal
+                        
+                    next_state = [{
+                        'obs': next_obs,
+                        'legal_actions': next_legal_dict,
+                        'raw_obs': next_obs
+                    }] * env.num_players
+            
+            experiences.append((
+                state[player_id],
+                action,
+                reward,
+                next_state[player_id],
+                done,
+                position,
+                active_players,
+                bets,
+                stacks,
+                stage,
+                opponent_behaviors
+            ))
+            
+            state = next_state
+            
+            if done:
+                state = env.reset()
+
+        result_queue.put((experiences, local_opponent_stats))
+    except Exception as e:
+        logging.error(f"Experience collection crashed: {str(e)}")
+        result_queue.put(([], local_opponent_stats))
+      
             
             # Выбор действия
             action = agents[player_id].step(
