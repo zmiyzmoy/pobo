@@ -373,7 +373,7 @@ class CustomDQNAgent:
             recent_rewards = np.mean(self.reward_buffer)
             self.epsilon = max(epsilon_end, self.epsilon * (0.99 if recent_rewards < 0 else 0.95))
 
-        def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
+     def step(self, state, position, active_players, bets, stacks, stage, opponent_behaviors):
         logging.debug(f"Step input: state type={type(state)}, state={state}")
         if not isinstance(state, dict):
             logging.error(f"State is not a dict: type={type(state)}, value={state}")
