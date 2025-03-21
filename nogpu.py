@@ -1,3 +1,12 @@
+import os
+import logging
+
+# Конфигурация логирования
+log_dir = '/home/gunelmikayilova91/rlcard/logs/'
+os.makedirs(log_dir, exist_ok=True)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s',
+                    handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,8 +26,6 @@ from treys import Evaluator, Card
 from functools import lru_cache
 from threading import Lock
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s',
-                    handlers=[logging.FileHandler(os.path.join(log_dir, 'training.log')), logging.StreamHandler()])
 
 # ========== КОНФИГУРАЦИЯ ==========
 model_path = '/home/gunelmikayilova91/rlcard/pai.pt'
