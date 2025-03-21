@@ -391,29 +391,34 @@ def collect_experience(args):
     
     if not isinstance(state, list):
         logging.warning(f"State is not a list, assuming single-player state format: {type(state)}")
-        state = [state] * env.num_players
-    
-    if len(state) != env.num_players:
-        logging.error(f"Invalid state length: expected {env.num_players}, got {len(state)}")
-        return [], local_opponent_stats
+        if isinstance(state, tuple):
+            state_dict = {'obs': state[0], 'legal_actions': state[1]}
+            state = [state_dict] * env.num_players
+        else:
+            state = [state] * env.num_players
     
     num_players = len(env.game.players)
-    if num_players != 6:
-        logging.warning(f"Expected 6 players, got {num_players}. Adjusting logic.")
+    if num_players != env.num_players:
+        logging.error(f"Player count mismatch: env.num_players={env.num_players}, actual={num_players}")
+        return [], local_opponent_stats
     
     for _ in range(num_steps):
         player_id = env.timestep % len(agents)
         position = env.game.get_player_id()
         active_players = len([p for p in env.game.players if p.status != 'folded'])
         bets = [env.game.players[i].in_chips if i < num_players and env.game.players[i].status != 'folded' else 0 for i in range(6)]
-        stacks = [p.remain_chips for p in env.game.players] + [0] * (6 - num_players)
+        stacks = [p.chips for p in env.game.players] + [0] * (6 - num_players)
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
         next_state, reward, done, _ = env.step(action)
         
         if not isinstance(next_state, list):
-            next_state = [next_state] * env.num_players
+            if isinstance(next_state, tuple):
+                next_state_dict = {'obs': next_state[0], 'legal_actions': next_state[1]}
+                next_state = [next_state_dict] * env.num_players
+            else:
+                next_state = [next_state] * env.num_players
         
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
         player_cards, community_cards = extract_cards(state[player_id], stage)
@@ -429,10 +434,11 @@ def collect_experience(args):
         if done:
             state = env.reset()
             if not isinstance(state, list):
-                state = [state] * env.num_players
-            if len(state) != env.num_players:
-                logging.error(f"Invalid state length after reset: expected {env.num_players}, got {len(state)}")
-                break
+                if isinstance(state, tuple):
+                    state_dict = {'obs': state[0], 'legal_actions': state[1]}
+                    state = [state_dict] * env.num_players
+                else:
+                    state = [state] * env.num_players
     return experiences, local_opponent_stats
 
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
@@ -444,20 +450,28 @@ def tournament(env, num):
     for _ in range(num):
         state = env.reset()
         if not isinstance(state, list):
-            state = [state] * env.num_players
+            if isinstance(state, tuple):
+                state_dict = {'obs': state[0], 'legal_actions': state[1]}
+                state = [state_dict] * env.num_players
+            else:
+                state = [state] * env.num_players
         done = False
         while not done:
             player_id = env.timestep % env.num_players
             position = env.game.get_player_id()
             active_players = len([p for p in env.game.players if p.status != 'folded'])
             bets = [env.game.players[i].in_chips if i < num_players and env.game.players[i].status != 'folded' else 0 for i in range(6)]
-            stacks = [p.remain_chips for p in env.game.players] + [0] * (6 - num_players)
+            stacks = [p.chips for p in env.game.players] + [0] * (6 - num_players)
             stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
             opponent_behaviors = np.array([opponent_stats.get_behavior(i, stage) for i in range(6) if i < num_players and i != player_id and env.game.players[i].status != 'folded'])
             action, _ = env.agents[player_id].eval_step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
             state, reward, done, _ = env.step(action)
             if not isinstance(state, list):
-                state = [state] * env.num_players
+                if isinstance(state, tuple):
+                    state_dict = {'obs': state[0], 'legal_actions': state[1]}
+                    state = [state_dict] * env.num_players
+                else:
+                    state = [state] * env.num_players
             if player_id == 0:
                 total_reward += reward[player_id] if isinstance(reward, list) else reward
                 if action == 0:
@@ -552,7 +566,9 @@ class TrainingSession:
     def train(self):
         envs = [rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42 + i}) for i in range(num_tables)]
         for i, env in enumerate(envs):
-            logging.debug(f"Env {i}: num_players={env.num_players}")
+            logging.info(f"Env {i}: num_players={env.num_players}, state_shape={env.state_shape}")
+            if env.num_players != 6:
+                logging.warning(f"Environment {i} initialized with {env.num_players} players instead of 6")
         
         base_state_size = np.prod(envs[0].state_shape[0]) - 52 + 84
         extra_features = 2 + 6 + 6 + 4 + (5 * 3) + 2
@@ -560,8 +576,8 @@ class TrainingSession:
         num_actions = envs[0].num_actions
         self.initialize_models(state_size, num_actions)
 
-        agent_styles = ['tight', 'loose', 'aggressive', 'bluffer', 'default', 'passive', 'tight-aggressive', 'loose-passive']
-        agents_per_table = [[CustomDQNAgent(self.model, s) for s in agent_styles[:6]] for _ in range(num_tables)]
+        agent_styles = ['tight', 'loose', 'aggressive', 'bluffer', 'default', 'passive']
+        agents_per_table = [[CustomDQNAgent(self.model, s) for s in agent_styles[:min(6, envs[i].num_players)]] for i in range(num_tables)]
         for env, agents in zip(envs, agents_per_table):
             env.set_agents(agents)
 
@@ -569,7 +585,7 @@ class TrainingSession:
         hand_history = HandHistory()
 
         test_env = rlcard.make('no-limit-holdem', config={'num_players': 6, 'seed': 42})
-        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles[:6]]
+        test_agents = [CustomDQNAgent(self.model, s) for s in agent_styles[:min(6, test_env.num_players)]]
         test_env.set_agents(test_agents)
 
         tracemalloc.start()
