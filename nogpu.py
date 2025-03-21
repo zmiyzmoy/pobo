@@ -432,12 +432,13 @@ def collect_experience(args):
     state = env.reset()
     state_warning_logged = False
     
+    # Преобразование начального состояния
     if not isinstance(state, list):
         if not state_warning_logged:
             logging.warning(f"Initial state is not a list, assuming single-player state format: {type(state)}")
             state_warning_logged = True
         if isinstance(state, tuple):
-            state_dict = {'obs': state[0], 'legal_actions': state[1]}  # Кортеж от env.reset
+            state_dict = {'obs': state[0], 'legal_actions': state[1]}  # state[1] — это OrderedDict
             state = [state_dict] * env.num_players
         else:
             logging.error(f"Unexpected initial state type: {type(state)}, value={state}")
@@ -456,12 +457,19 @@ def collect_experience(args):
         stacks = [p.remained_chips if i < num_players_actual else 0 for i, p in enumerate(env.game.players)]
         stage = [1 if env.game.round_counter == i else 0 for i in range(4)]
         opponent_behaviors = np.array([local_opponent_stats.get_behavior(i, stage) for i in range(num_players) if i != player_id and env.game.players[i].status == 'alive'])
+        
+        # Проверка состояния перед шагом агента
+        logging.debug(f"Before agent step: player_id={player_id}, state={state[player_id]}")
         action = agents[player_id].step(state[player_id], position, active_players, bets, stacks, stage, opponent_behaviors)
+        
+        # Выполнение шага в окружении
         logging.debug(f"Before env.step: action={action}, state={state[player_id]}")
         next_state, reward, done, info = env.step(action)
         
+        # Проверка результата env.step
         logging.debug(f"Step {step_idx}: action={action}, next_state type={type(next_state)}, next_state={next_state}, reward={reward}, done={done}, info={info}")
         
+        # Преобразование next_state
         if not isinstance(next_state, list):
             if isinstance(next_state, tuple):
                 next_state_dict = {'obs': next_state[0], 'legal_actions': next_state[1]}
@@ -470,6 +478,7 @@ def collect_experience(args):
                 logging.error(f"Unexpected next_state type: {type(next_state)}, value={next_state}")
                 return [], local_opponent_stats
         
+        # Обновление статистики и опыта
         local_opponent_stats.update(player_id, action, stage, action if action > 1 else 0)
         player_cards, community_cards = extract_cards(state[player_id], stage)
         hand_strength = cached_evaluate(player_cards, community_cards)
@@ -480,7 +489,11 @@ def collect_experience(args):
             state[player_id], action, total_reward, next_state[player_id], done,
             position, active_players, bets, stacks, stage, opponent_behaviors
         ))
+        
+        # Обновление состояния
         state = next_state
+        
+        # Сброс при завершении эпизода
         if done:
             state = env.reset()
             if not isinstance(state, list):
@@ -490,6 +503,7 @@ def collect_experience(args):
                 else:
                     logging.error(f"Unexpected reset state type: {type(state)}, value={state}")
                     return [], local_opponent_stats
+    
     return experiences, local_opponent_stats
 # ========== ТЕСТИРОВАНИЕ С МЕТРИКАМИ ==========
 def tournament(env, num):
