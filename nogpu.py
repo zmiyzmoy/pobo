@@ -171,6 +171,35 @@ def extract_cards(state_dict, stage):
         logging.error(f"Error in extract_cards: {str(e)}")
         return (), ()
 
+# ========== EMBEDDING КАРТ ==========
+class CardEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rank_embed = nn.Embedding(13, 8)  # 13 рангов (2-A)
+        self.suit_embed = nn.Embedding(4, 4)   # 4 масти
+        
+    def forward(self, cards):
+        try:
+            if not cards:
+                return torch.zeros(12).to(device)
+                
+            ranks = []
+            suits = []
+            for card in cards:
+                ranks.append(Card.get_rank_int(card) - 2)  # Приводим к диапазону 0-12
+                suits.append(Card.get_suit_int(card))
+            
+            ranks = torch.tensor(ranks, dtype=torch.long).to(device)
+            suits = torch.tensor(suits, dtype=torch.long).to(device)
+            
+            return torch.cat([
+                self.rank_embed(ranks).mean(dim=0),
+                self.suit_embed(suits).mean(dim=0)
+            ])
+        except Exception as e:
+            logging.error(f"Card embedding failed: {str(e)}")
+            return torch.zeros(12).to(device)
+
 # ========== ПОТОКОБЕЗОПАСНАЯ СТАТИСТИКА ОППОНЕНТОВ ==========
 class SharedOpponentStats:
     def __init__(self):
