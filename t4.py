@@ -950,5 +950,10 @@ class Trainer:
 # ===== ЗАПУСК =====
 if __name__ == "__main__":
     mp.set_start_method('spawn')
-    trainer = Trainer()
+    config = Config()
+    ray.init(num_gpus=1, ignore_reinit_error=True)
+    game = pyspiel.load_game(config.GAME_NAME)
+    processor = StateProcessor()
+    agent = PokerAgent(game, processor)
+    trainer = Trainer(game, agent, processor)
     trainer.train()
