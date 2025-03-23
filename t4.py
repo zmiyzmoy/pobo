@@ -553,7 +553,7 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             queue.put(([], OpponentStats(), 0))
             return ([], OpponentStats(), 0)
 
-        agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]  # 5 противников для 6 игроков
+        agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]  # 5 противников
         for i, opp in enumerate(agents[1:], 1):
             if agent.strategy_pool and random.random() < 0.5:
                 opp.strategy_net.load_state_dict(random.choice([s['weights'] for s in agent.strategy_pool]))
