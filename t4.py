@@ -413,6 +413,11 @@ class PokerAgent(policy.Policy):
         self.num_actions = game.num_distinct_actions()
         self.regret_net = RegretNet(processor.state_size, self.num_actions).to(device)
         self.strategy_net = StrategyNet(processor.state_size, self.num_actions).to(device)
+        # Добавляем оптимизатор для regret_net и strategy_net, как требуется для Trainer
+        self.optimizer = torch.optim.Adam(
+            list(self.regret_net.parameters()) + list(self.strategy_net.parameters()), 
+            lr=config.LEARNING_RATE
+        )
         self.cumulative_regrets = {}
         self.cumulative_strategies = {}
         self.strategy_pool = []
