@@ -534,7 +534,6 @@ class PokerAgent(policy.Policy):
 @ray.remote(num_gpus=1)
 def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps: int, worker_id: int, queue: Queue):
     try:
-        # Добавлено ранее: импорт torch и перенос моделей на правильное устройство
         import torch
         if torch.cuda.is_available():
             agent.regret_net = agent.regret_net.to(device)
@@ -554,19 +553,27 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         opponent_stats = OpponentStats()
 
         for _ in range(steps):
+            # Проверяем терминальное состояние в начале каждой итерации
             if env.is_terminal():
                 returns = env.returns()
                 for pid in range(config.NUM_PLAYERS):
                     pos = (pid - env.current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
                     opponent_stats.update(pid, 0, [0, 0, 0, 0], sum(env.bets()), 0, False, pos, won=returns[pid])
                 env = game.new_initial_state()
+                continue  # Пропускаем остаток итерации после сброса состояния
+
+            # Теперь безопасно получаем player_id, так как состояние не терминальное
             player_id = env.current_player()
+            if player_id < 0:
+                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected")
+                break  # Прерываем цикл, если player_id всё же некорректен
+
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
             
-            # Исправлено: определяем стадию по количеству карт на доске
+            # Определяем стадию по количеству карт на доске
             info_tensor = env.information_state_tensor(player_id)
-            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]  # Карты на доске после 52-го индекса
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
@@ -602,10 +609,10 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         queue.put((experiences, opponent_stats, hands_per_sec))
         logging.info(f"Worker {worker_id} collected {len(experiences)} experiences at {hands_per_sec:.2f} hands/sec")
     except Exception as e:
-        # Исправлено: добавлен player_id в information_state_string
-        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string(player_id)}\nBets: {bets}\nStacks: {stacks}")
+        # Безопасное логирование: используем player_id, если он определён, иначе 0
+        player_id_safe = locals().get('player_id', 0)
+        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string(player_id_safe)}\nBets: {bets if 'bets' in locals() else 'N/A'}\nStacks: {stacks if 'stacks' in locals() else 'N/A'}")
         queue.put(([], OpponentStats(), 0))
-
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(policy.Policy):
     def __init__(self, game):
