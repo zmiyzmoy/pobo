@@ -51,13 +51,14 @@ class Config:
         self.LOG_FREQ = 100
         self.TEST_INTERVAL = 500
         self.LEARNING_RATE = 1e-4
-        self.NUM_PLAYERS = 2
+        self.NUM_PLAYERS = 6
         self.GRAD_CLIP_VALUE = 5.0
         self.CHECKPOINT_INTERVAL = 300  # 3600 для A100
         self.NUM_BUCKETS = 50
         self.BB = 2
+        self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
         #self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
-        self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
+        #self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
 # Инициализация
 config = Config()
 os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
@@ -546,12 +547,13 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         start_time = time.time()
         env = game.new_initial_state()
         logging.debug(f"Worker {worker_id}: Initial state created, terminal={env.is_terminal()}, current_player={env.current_player()}")
+
         if env.is_terminal():
             logging.error(f"Worker {worker_id}: Initial state is terminal")
             queue.put(([], OpponentStats(), 0))
             return ([], OpponentStats(), 0)
 
-        agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]
+        agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]  # 5 противников для 6 игроков
         for i, opp in enumerate(agents[1:], 1):
             if agent.strategy_pool and random.random() < 0.5:
                 opp.strategy_net.load_state_dict(random.choice([s['weights'] for s in agent.strategy_pool]))
