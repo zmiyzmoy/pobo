@@ -531,11 +531,10 @@ class PokerAgent(policy.Policy):
             self.strategy_pool = sorted(self.strategy_pool, key=lambda x: x['winrate'], reverse=True)[:10]
 
 # ===== СБОР ДАННЫХ =====
-
-@ray.remote(num_gpus=1)  # Изменено: добавлен num_gpus=1 для выделения GPU процессу
+@ray.remote(num_gpus=1)
 def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps: int, worker_id: int, queue: Queue):
     try:
-        # Добавлено: импорт torch и перенос моделей на правильное устройство
+        # Добавлено ранее: импорт torch и перенос моделей на правильное устройство
         import torch
         if torch.cuda.is_available():
             agent.regret_net = agent.regret_net.to(device)
@@ -564,12 +563,26 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             player_id = env.current_player()
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
-            stage = [1 if env.round() == i else 0 for i in range(4)]
-            is_blind = player_id in [0, 1] and env.round() == 0 and sum(bets) <= 0.15
+            
+            # Исправлено: определяем стадию по количеству карт на доске
+            info_tensor = env.information_state_tensor(player_id)
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]  # Карты на доске после 52-го индекса
+            num_board_cards = len(board_cards)
+            stage = [0] * 4
+            if num_board_cards == 0:
+                stage[0] = 1  # Префлоп
+            elif num_board_cards == 3:
+                stage[1] = 1  # Флоп
+            elif num_board_cards == 4:
+                stage[2] = 1  # Терн
+            elif num_board_cards == 5:
+                stage[3] = 1  # Ривер
+
+            is_blind = player_id in [0, 1] and num_board_cards == 0 and sum(bets) <= 0.15
             position = (player_id - env.current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
-            is_cbet = env.round() == 1 and sum(bets) > 0 and env.current_player() == 0
-            is_3bet = env.round() == 0 and any(b > config.BB for b in bets) and sum(bets) > 2 * config.BB
-            is_check = sum(bets) == 0 and env.round() > 0
+            is_cbet = num_board_cards == 3 and sum(bets) > 0 and env.current_player() == 0
+            is_3bet = num_board_cards == 0 and any(b > config.BB for b in bets) and sum(bets) > 2 * config.BB
+            is_check = sum(bets) == 0 and num_board_cards > 0
             is_raise = any(b > 0 for i, b in enumerate(bets) if i != player_id)
 
             action = agents[player_id].step(env, player_id, bets, stacks, stage, opponent_stats)
@@ -589,7 +602,8 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         queue.put((experiences, opponent_stats, hands_per_sec))
         logging.info(f"Worker {worker_id} collected {len(experiences)} experiences at {hands_per_sec:.2f} hands/sec")
     except Exception as e:
-        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string()}\nBets: {bets}\nStacks: {stacks}")
+        # Исправлено: добавлен player_id в information_state_string
+        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string(player_id)}\nBets: {bets}\nStacks: {stacks}")
         queue.put(([], OpponentStats(), 0))
 
 # ===== ТЕСТИРОВАНИЕ =====
