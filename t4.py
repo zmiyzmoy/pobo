@@ -403,6 +403,7 @@ class StateProcessor:
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor: StateProcessor):
+        player_ids = list(range(game.num_players()))  # [0, 1, 2, 3, 4, 5] для 6 игроков
         super().__init__(game)
         self.game = game
         self.processor = processor
