@@ -549,7 +549,7 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         if env.is_terminal():
             logging.error(f"Worker {worker_id}: Initial state is terminal")
             queue.put(([], OpponentStats(), 0))
-            return ([], OpponentStats(), 0)  # Явно возвращаем результат для Ray
+            return ([], OpponentStats(), 0)
 
         agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]
         for i, opp in enumerate(agents[1:], 1):
@@ -565,13 +565,14 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
                     pos = (pid - (env.current_player() if not env.is_terminal() else 0) + config.NUM_PLAYERS) % config.NUM_PLAYERS
                     opponent_stats.update(pid, 0, [0, 0, 0, 0], sum(env.bets()), 0, False, pos, won=returns[pid])
                 env = game.new_initial_state()
+                logging.debug(f"Worker {worker_id}: Reset state at step {step}, terminal={env.is_terminal()}, current_player={env.current_player()}")
                 continue
 
             player_id = env.current_player()
             if player_id < 0:
-                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}, state={env.information_state_string()}")
+                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}")
                 queue.put(([], OpponentStats(), 0))
-                return ([], OpponentStats(), 0)  # Явно возвращаем результат для Ray
+                return ([], OpponentStats(), 0)
 
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
@@ -615,14 +616,11 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         hands_per_sec = steps / elapsed_time
         queue.put((experiences, opponent_stats, hands_per_sec))
         logging.info(f"Worker {worker_id} collected {len(experiences)} experiences at {hands_per_sec:.2f} hands/sec")
-        return (experiences, opponent_stats, hands_per_sec)  # Явно возвращаем результат для Ray
+        return (experiences, opponent_stats, hands_per_sec)
     except Exception as e:
-        player_id_safe = locals().get('player_id', 0)
-        bets_safe = locals().get('bets', 'N/A')
-        stacks_safe = locals().get('stacks', 'N/A')
-        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string(player_id_safe)}\nBets: {bets_safe}\nStacks: {stacks_safe}")
+        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: Not available (terminal state issue)\nBets: {locals().get('bets', 'N/A')}\nStacks: {locals().get('stacks', 'N/A')}")
         queue.put(([], OpponentStats(), 0))
-        return ([], OpponentStats(), 0)  # Явно возвращаем результат для Ray
+        return ([], OpponentStats(), 0)
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(policy.Policy):
     def __init__(self, game):
