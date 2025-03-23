@@ -545,6 +545,12 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 
         start_time = time.time()
         env = game.new_initial_state()
+        # Добавлено: проверка начального состояния
+        if env.is_terminal():
+            logging.error(f"Worker {worker_id}: Initial state is terminal")
+            queue.put(([], OpponentStats(), 0))
+            return
+
         agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]
         for i, opp in enumerate(agents[1:], 1):
             if agent.strategy_pool and random.random() < 0.5:
@@ -553,11 +559,9 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         opponent_stats = OpponentStats()
 
         for step in range(steps):
-            # Проверяем терминальность в начале каждой итерации
             if env.is_terminal():
                 returns = env.returns()
                 for pid in range(config.NUM_PLAYERS):
-                    # Используем pid вместо env.current_player() для терминальных состояний
                     pos = (pid - (env.current_player() if not env.is_terminal() else 0) + config.NUM_PLAYERS) % config.NUM_PLAYERS
                     opponent_stats.update(pid, 0, [0, 0, 0, 0], sum(env.bets()), 0, False, pos, won=returns[pid])
                 env = game.new_initial_state()
@@ -566,12 +570,12 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             player_id = env.current_player()
             if player_id < 0:
                 logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}")
-                break
+                queue.put(([], OpponentStats(), 0))
+                return
 
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
             
-            # Определяем стадию по количеству карт на доске
             info_tensor = env.information_state_tensor(player_id)
             board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
@@ -596,11 +600,10 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             next_state = env.clone()
             next_state.apply_action(action)
 
-            # Проверяем терминальность после действия
             if next_state.is_terminal():
                 final_reward = next_state.returns()[player_id]
             else:
-                final_reward = 0.0  # Для не-терминальных состояний финальная награда будет позже
+                final_reward = 0.0
             heuristic_reward = agents[player_id]._heuristic_reward(action, env, player_id, bets, opponent_stats)
             reward = heuristic_reward if not next_state.is_terminal() else final_reward
 
@@ -613,7 +616,6 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         queue.put((experiences, opponent_stats, hands_per_sec))
         logging.info(f"Worker {worker_id} collected {len(experiences)} experiences at {hands_per_sec:.2f} hands/sec")
     except Exception as e:
-        # Используем безопасный player_id и проверяем наличие переменных
         player_id_safe = locals().get('player_id', 0)
         bets_safe = locals().get('bets', 'N/A')
         stacks_safe = locals().get('stacks', 'N/A')
@@ -878,89 +880,92 @@ class Trainer:
         self.agent.strategy_pool = checkpoint['strategy_pool']
 
     def train(self):
-        pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
-        agent_stats = OpponentStats()
+    pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
+    agent_stats = OpponentStats()
 
-        def signal_handler(sig, frame):
-            self.interrupted = True
-            self._save_checkpoint(config.MODEL_PATH)
-            ray.shutdown()
-            sys.exit(0)
+    def signal_handler(sig, frame):
+        self.interrupted = True
+        self._save_checkpoint(config.MODEL_PATH)
+        ray.shutdown()
+        sys.exit(0)
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-        if os.path.exists(config.MODEL_PATH):
-            self._load_checkpoint(config.MODEL_PATH)
+    if os.path.exists(config.MODEL_PATH):
+        self._load_checkpoint(config.MODEL_PATH)
 
-        try:
-            #ray.init(num_gpus=1, num_cpus=config.NUM_WORKERS, ignore_reinit_error=True)
-            queues = [Queue() for _ in range(config.NUM_WORKERS)]
-            tasks = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i, queues[i])
-                     for i in range(config.NUM_WORKERS)]
-        except Exception as e:
-            logging.warning(f"Ray initialization failed: {e}, falling back to single-threaded mode")
-            def single_thread_collect():
-                queue = Queue()
-                collect_experience(self.game, self.agent, self.processor, config.STEPS_PER_WORKER * config.NUM_WORKERS, 0, queue)
-                return [queue.get()]
-            tasks = single_thread_collect
+    try:
+        queues = [Queue() for _ in range(config.NUM_WORKERS)]
+        tasks = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i, queues[i])
+                 for i in range(config.NUM_WORKERS)]
+    except Exception as e:
+        logging.warning(f"Ray initialization failed: {e}, falling back to single-threaded mode")
+        def single_thread_collect():
+            queue = Queue()
+            collect_experience(self.game, self.agent, self.processor, config.STEPS_PER_WORKER * config.NUM_WORKERS, 0, queue)
+            return [queue.get()]
+        tasks = single_thread_collect
 
-        try:
-            for episode in range(self.global_step // config.STEPS_PER_WORKER, config.NUM_EPISODES):
-                results = tasks() if callable(tasks) else ray.get(tasks)
-                for experiences, local_opp_stats, hands_per_sec in results:
-                    if not experiences:
-                        continue
-                    self.buffer.add_batch(experiences, self.processor)
-                    for exp in experiences:
-                        self.reward_normalizer.update(exp[2])
-                        self.global_step += 1
-                        self.agent.global_step = self.global_step
-                        self.buffer.global_step = self.global_step
-                        if exp[5] == 0:
-                            is_blind = exp[5] in [0, 1] and np.argmax(exp[8]) == 0 and sum(exp[6]) <= 0.15
-                            pos = (exp[5] - exp[0].current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
-                            is_raise = any(b > 0 for i, b in enumerate(exp[6]) if i != exp[5])
-                            agent_stats.update(0, exp[1], exp[8], sum(exp[6]), exp[1] if exp[1] > 1 else 0, is_blind, pos, is_raise=is_raise)
-                    self.opponent_stats.stats.update(local_opp_stats.stats)
-                    writer.add_scalar('HandsPerSec', hands_per_sec, self.global_step)
+    try:
+        for episode in range(self.global_step // config.STEPS_PER_WORKER, config.NUM_EPISODES):
+            results = tasks() if callable(tasks) else ray.get(tasks)
+            # Добавлено: проверка корректности results
+            if results is None or not isinstance(results, list):
+                logging.error(f"Episode {episode}: No valid results from collect_experience, skipping episode")
+                continue
 
-                if len(self.buffer) >= config.BATCH_SIZE:
-                    loss = self._train_step(self.buffer.sample(config.BATCH_SIZE))
-                    logging.info(f"Step {self.global_step} | Loss: {loss:.4f}")
+            for experiences, local_opp_stats, hands_per_sec in results:
+                if not experiences:
+                    continue
+                self.buffer.add_batch(experiences, self.processor)
+                for exp in experiences:
+                    self.reward_normalizer.update(exp[2])
+                    self.global_step += 1
+                    self.agent.global_step = self.global_step
+                    self.buffer.global_step = self.global_step
+                    if exp[5] == 0:
+                        is_blind = exp[5] in [0, 1] and np.argmax(exp[8]) == 0 and sum(exp[6]) <= 0.15
+                        pos = (exp[5] - exp[0].current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
+                        is_raise = any(b > 0 for i, b in enumerate(exp[6]) if i != exp[5])
+                        agent_stats.update(0, exp[1], exp[8], sum(exp[6]), exp[1] if exp[1] > 1 else 0, is_blind, pos, is_raise=is_raise)
+                self.opponent_stats.stats.update(local_opp_stats.stats)
+                writer.add_scalar('HandsPerSec', hands_per_sec, self.global_step)
 
-                if self.global_step % config.TEST_INTERVAL == 0:
-                    winrate, exp_score = run_tournament(self.game, self.agent, self.processor)
-                    agent_metrics = agent_stats.get_metrics(0)
-                    writer.add_scalar('Winrate', winrate, self.global_step)
-                    writer.add_scalar('Agent_VPIP', agent_metrics['vpip'], self.global_step)
-                    self.lr_scheduler.step(winrate)
-                    if winrate > self.best_winrate:
-                        self.best_winrate = winrate
-                        self._save_checkpoint(config.BEST_MODEL_PATH, is_best=True)
+            if len(self.buffer) >= config.BATCH_SIZE:
+                loss = self._train_step(self.buffer.sample(config.BATCH_SIZE))
+                logging.info(f"Step {self.global_step} | Loss: {loss:.4f}")
 
-                if time.time() - self.last_checkpoint_time >= config.CHECKPOINT_INTERVAL:
-                    self._save_checkpoint(config.MODEL_PATH)
+            if self.global_step % config.TEST_INTERVAL == 0:
+                winrate, exp_score = run_tournament(self.game, self.agent, self.processor)
+                agent_metrics = agent_stats.get_metrics(0)
+                writer.add_scalar('Winrate', winrate, self.global_step)
+                writer.add_scalar('Agent_VPIP', agent_metrics['vpip'], self.global_step)
+                self.lr_scheduler.step(winrate)
+                if winrate > self.best_winrate:
+                    self.best_winrate = winrate
+                    self._save_checkpoint(config.BEST_MODEL_PATH, is_best=True)
 
-                pbar.update(1)
-                if self.interrupted:
-                    break
+            if time.time() - self.last_checkpoint_time >= config.CHECKPOINT_INTERVAL:
+                self._save_checkpoint(config.MODEL_PATH)
 
-            self._save_checkpoint(config.MODEL_PATH)
-            ray.shutdown()
-        except Exception as e:
-            error_msg = f"Training crashed: {traceback.format_exc()}\nLast experiences: {experiences[-1] if 'experiences' in locals() else 'N/A'}"
-            logging.error(error_msg)
-            with open(os.path.join(config.LOG_DIR, 'crash_details.txt'), 'a') as f:
-                f.write(f"{time.ctime()}: {error_msg}\n")
-            self._save_checkpoint(os.path.join(config.LOG_DIR, 'crash_recovery.pt'))
-            ray.shutdown()
-            sys.exit(1)
+            pbar.update(1)
+            if self.interrupted:
+                break
 
-        pbar.close()
-        writer.close()
+        self._save_checkpoint(config.MODEL_PATH)
+        ray.shutdown()
+    except Exception as e:
+        error_msg = f"Training crashed: {traceback.format_exc()}\nLast experiences: {experiences[-1] if 'experiences' in locals() else 'N/A'}"
+        logging.error(error_msg)
+        with open(os.path.join(config.LOG_DIR, 'crash_details.txt'), 'a') as f:
+            f.write(f"{time.ctime()}: {error_msg}\n")
+        self._save_checkpoint(os.path.join(config.LOG_DIR, 'crash_recovery.pt'))
+        ray.shutdown()
+        sys.exit(1)
 
+    pbar.close()
+    writer.close()
 # ===== ЗАПУСК =====
 if __name__ == "__main__":
     mp.set_start_method('spawn')
