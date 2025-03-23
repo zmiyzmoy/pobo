@@ -552,21 +552,21 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         experiences = []
         opponent_stats = OpponentStats()
 
-        for _ in range(steps):
-            # Проверяем терминальное состояние в начале каждой итерации
+        for step in range(steps):
+            # Проверяем терминальность в начале каждой итерации
             if env.is_terminal():
                 returns = env.returns()
                 for pid in range(config.NUM_PLAYERS):
-                    pos = (pid - env.current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
+                    # Используем pid вместо env.current_player() для терминальных состояний
+                    pos = (pid - (env.current_player() if not env.is_terminal() else 0) + config.NUM_PLAYERS) % config.NUM_PLAYERS
                     opponent_stats.update(pid, 0, [0, 0, 0, 0], sum(env.bets()), 0, False, pos, won=returns[pid])
                 env = game.new_initial_state()
-                continue  # Пропускаем остаток итерации после сброса состояния
+                continue
 
-            # Теперь безопасно получаем player_id, так как состояние не терминальное
             player_id = env.current_player()
             if player_id < 0:
-                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected")
-                break  # Прерываем цикл, если player_id всё же некорректен
+                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}")
+                break
 
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
@@ -596,7 +596,11 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             next_state = env.clone()
             next_state.apply_action(action)
 
-            final_reward = next_state.returns()[player_id]
+            # Проверяем терминальность после действия
+            if next_state.is_terminal():
+                final_reward = next_state.returns()[player_id]
+            else:
+                final_reward = 0.0  # Для не-терминальных состояний финальная награда будет позже
             heuristic_reward = agents[player_id]._heuristic_reward(action, env, player_id, bets, opponent_stats)
             reward = heuristic_reward if not next_state.is_terminal() else final_reward
 
@@ -609,9 +613,11 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         queue.put((experiences, opponent_stats, hands_per_sec))
         logging.info(f"Worker {worker_id} collected {len(experiences)} experiences at {hands_per_sec:.2f} hands/sec")
     except Exception as e:
-        # Безопасное логирование: используем player_id, если он определён, иначе 0
+        # Используем безопасный player_id и проверяем наличие переменных
         player_id_safe = locals().get('player_id', 0)
-        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string(player_id_safe)}\nBets: {bets if 'bets' in locals() else 'N/A'}\nStacks: {stacks if 'stacks' in locals() else 'N/A'}")
+        bets_safe = locals().get('bets', 'N/A')
+        stacks_safe = locals().get('stacks', 'N/A')
+        logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string(player_id_safe)}\nBets: {bets_safe}\nStacks: {stacks_safe}")
         queue.put(([], OpponentStats(), 0))
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(policy.Policy):
