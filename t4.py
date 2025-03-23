@@ -51,13 +51,13 @@ class Config:
         self.LOG_FREQ = 100
         self.TEST_INTERVAL = 500
         self.LEARNING_RATE = 1e-4
-        self.NUM_PLAYERS = 6
+        self.NUM_PLAYERS = 2
         self.GRAD_CLIP_VALUE = 5.0
         self.CHECKPOINT_INTERVAL = 300  # 3600 для A100
         self.NUM_BUCKETS = 50
         self.BB = 2
         #self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
-        self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
+        self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
 # Инициализация
 config = Config()
 os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
@@ -545,11 +545,11 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 
         start_time = time.time()
         env = game.new_initial_state()
-        # Добавлено: проверка начального состояния
+        logging.debug(f"Worker {worker_id}: Initial state created, terminal={env.is_terminal()}, current_player={env.current_player()}")
         if env.is_terminal():
             logging.error(f"Worker {worker_id}: Initial state is terminal")
             queue.put(([], OpponentStats(), 0))
-            return
+            return ([], OpponentStats(), 0)  # Явно возвращаем результат для Ray
 
         agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]
         for i, opp in enumerate(agents[1:], 1):
@@ -569,9 +569,9 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 
             player_id = env.current_player()
             if player_id < 0:
-                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}")
+                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}, state={env.information_state_string()}")
                 queue.put(([], OpponentStats(), 0))
-                return
+                return ([], OpponentStats(), 0)  # Явно возвращаем результат для Ray
 
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
@@ -615,12 +615,14 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         hands_per_sec = steps / elapsed_time
         queue.put((experiences, opponent_stats, hands_per_sec))
         logging.info(f"Worker {worker_id} collected {len(experiences)} experiences at {hands_per_sec:.2f} hands/sec")
+        return (experiences, opponent_stats, hands_per_sec)  # Явно возвращаем результат для Ray
     except Exception as e:
         player_id_safe = locals().get('player_id', 0)
         bets_safe = locals().get('bets', 'N/A')
         stacks_safe = locals().get('stacks', 'N/A')
         logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: {env.information_state_string(player_id_safe)}\nBets: {bets_safe}\nStacks: {stacks_safe}")
         queue.put(([], OpponentStats(), 0))
+        return ([], OpponentStats(), 0)  # Явно возвращаем результат для Ray
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(policy.Policy):
     def __init__(self, game):
