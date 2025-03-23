@@ -551,7 +551,6 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 
         start_time = time.time()
         env = game.new_initial_state()
-        # Добавляем отладку для диагностики начального состояния
         logging.debug(f"Worker {worker_id}: Initial state created, terminal={env.is_terminal()}, current_player={env.current_player()}, state={env.__str__()}")
 
         if env.is_terminal():
@@ -573,16 +572,23 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
                     pos = (pid - (env.current_player() if not env.is_terminal() else 0) + config.NUM_PLAYERS) % config.NUM_PLAYERS
                     opponent_stats.update(pid, 0, [0, 0, 0, 0], sum(env.bets()), 0, False, pos, won=returns[pid])
                 env = game.new_initial_state()
-                # Добавляем отладку для состояния после сброса
                 logging.debug(f"Worker {worker_id}: Reset state at step {step}, terminal={env.is_terminal()}, current_player={env.current_player()}")
                 continue
 
             player_id = env.current_player()
             if player_id < 0:
-                # Добавляем больше деталей для диагностики
-                logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}, state={env.__str__()}, legal_actions={env.legal_actions()}")
-                queue.put(([], OpponentStats(), 0))
-                return ([], OpponentStats(), 0)
+                # Обработка "chance node" (узел шанса, где раздаются карты)
+                legal_actions = env.legal_actions()
+                action = random.choice(legal_actions)  # Выбираем случайное действие (например, ACTION_DEAL)
+                next_state = env.clone()
+                next_state.apply_action(action)
+                env = next_state
+                logging.debug(f"Worker {worker_id}: Chance node at step {step}, player_id={player_id}, action={action}, new_state={env.__str__()}")
+                continue  # Переходим к следующему шагу, так как это не действие игрока
+                # Оригинальная обработка ошибки закомментирована:
+                # logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}, state={env.__str__()}, legal_actions={env.legal_actions()}")
+                # queue.put(([], OpponentStats(), 0))
+                # return ([], OpponentStats(), 0)
 
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
