@@ -54,7 +54,7 @@ class Config:
         self.CHECKPOINT_INTERVAL = 300  # 3600 для A100
         self.NUM_BUCKETS = 50
         self.BB = 2
-        self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
+        self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
 
 # Инициализация
 config = Config()
