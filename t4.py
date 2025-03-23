@@ -879,7 +879,7 @@ class Trainer:
         self.reward_normalizer.std = np.std(self.reward_normalizer.rewards) + self.reward_normalizer.eps if self.reward_normalizer.rewards else 1
         self.agent.strategy_pool = checkpoint['strategy_pool']
 
-    def train(self):
+def train(self):
     pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
     agent_stats = OpponentStats()
 
@@ -910,7 +910,6 @@ class Trainer:
     try:
         for episode in range(self.global_step // config.STEPS_PER_WORKER, config.NUM_EPISODES):
             results = tasks() if callable(tasks) else ray.get(tasks)
-            # Добавлено: проверка корректности results
             if results is None or not isinstance(results, list):
                 logging.error(f"Episode {episode}: No valid results from collect_experience, skipping episode")
                 continue
@@ -966,6 +965,7 @@ class Trainer:
 
     pbar.close()
     writer.close()
+
 # ===== ЗАПУСК =====
 if __name__ == "__main__":
     mp.set_start_method('spawn')
