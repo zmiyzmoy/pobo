@@ -406,7 +406,7 @@ class StateProcessor:
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor: StateProcessor):
-        player_ids = list(range(game.num_players()))  # [0, 1, 2, 3, 4, 5] для 6 игроков
+        player_ids = list(range(game.num_players()))
         super().__init__(game, player_ids)
         self.game = game
         self.processor = processor
@@ -415,7 +415,7 @@ class PokerAgent(policy.Policy):
         self.strategy_net = StrategyNet(processor.state_size, self.num_actions).to(device)
         # Добавляем оптимизатор для regret_net и strategy_net, как требуется для Trainer
         self.optimizer = torch.optim.Adam(
-            list(self.regret_net.parameters()) + list(self.strategy_net.parameters()), 
+            list(self.regret_net.parameters()) + list(self.strategy_net.parameters()),
             lr=config.LEARNING_RATE
         )
         self.cumulative_regrets = {}
@@ -441,8 +441,21 @@ class PokerAgent(policy.Policy):
         pot = sum(bets)
         opp_metrics = [opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != player_id]
         hand_strength = self._hand_strength(state, player_id)
-        stage_idx = state.round()
-        board_cards = [int(c) for i, c in enumerate(state.information_state_tensor(player_id)[52:]) if c >= 0]
+        # Используем stage_idx из количества карт вместо state.round()
+        info_tensor = state.information_state_tensor(player_id)
+        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+        num_board_cards = len(board_cards)
+        stage_idx = 0  # По умолчанию префлоп
+        if num_board_cards == 0:
+            stage_idx = 0  # Префлоп
+        elif num_board_cards == 3:
+            stage_idx = 1  # Флоп
+        elif num_board_cards == 4:
+            stage_idx = 2  # Терн
+        elif num_board_cards == 5:
+            stage_idx = 3  # Ривер
+        # Оригинальная строка закомментирована (если была):
+        # stage_idx = state.round()
         is_drawy = len(set([c // 13 for c in board_cards])) < 3 if board_cards else False
 
         if action == 0 and pot > 0:
@@ -485,7 +498,21 @@ class PokerAgent(policy.Policy):
         info_state = state.information_state_string(player_id)
         bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
         stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-        stage = [1 if state.round() == i else 0 for i in range(4)]
+        # Определяем стадию по количеству карт на столе вместо round()
+        info_tensor = state.information_state_tensor(player_id)
+        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+        num_board_cards = len(board_cards)
+        stage = [0] * 4
+        if num_board_cards == 0:
+            stage[0] = 1  # Префлоп
+        elif num_board_cards == 3:
+            stage[1] = 1  # Флоп
+        elif num_board_cards == 4:
+            stage[2] = 1  # Терн
+        elif num_board_cards == 5:
+            stage[3] = 1  # Ривер
+        # Оригинальная строка закомментирована:
+        # stage = [1 if state.round() == i else 0 for i in range(4)]
         opponent_stats = OpponentStats()
         state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
 
@@ -517,6 +544,7 @@ class PokerAgent(policy.Policy):
             state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
             q_value = self.strategy_net(state_tensor).max().item()
             last_opp_bet = max([opponent_stats.get_metrics(i)['last_bet'] for i in range(config.NUM_PLAYERS) if i != player_id], default=0)
+            # Используем переданный stage вместо state.round()
             bet_size = self._dynamic_bet_size(state, stacks, bets, player_id, opponent_stats.get_metrics(player_id), q_value, stage, last_opp_bet)
             if bet_size >= stacks[player_id] and 4 in state.legal_actions(player_id):
                 action = 4
@@ -535,7 +563,6 @@ class PokerAgent(policy.Policy):
             self.best_winrate = max(self.best_winrate, winrate)
         if len(self.strategy_pool) > 10:
             self.strategy_pool = sorted(self.strategy_pool, key=lambda x: x['winrate'], reverse=True)[:10]
-
 # ===== СБОР ДАННЫХ =====
 @ray.remote(num_gpus=1)
 def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps: int, worker_id: int, queue: Queue):
