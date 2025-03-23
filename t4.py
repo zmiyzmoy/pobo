@@ -634,10 +634,10 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(pyspiel.Policy):
     def __init__(self, game):
-        # Исправляем вызов базового конструктора, добавляя player_ids
-        super().__init__(game, list(range(game.num_players())))  # Передаём всех игроков (0-5 для 6 игроков)
+        # Исправляем вызов базового конструктора: передаём только game
+        super().__init__(game)
         # Оригинальная строка закомментирована для истории:
-        # super().__init__(game)
+        # super().__init__(game, list(range(game.num_players())))  # Передаём всех игроков (0-5 для 6 игроков)
         self.game = game
 
     def _hand_strength(self, state, player_id: int) -> float:
