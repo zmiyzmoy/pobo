@@ -342,59 +342,62 @@ class StateProcessor:
             return [r + suit_mapping[s] * 13 for r, s in zip(original_ranks, original_suits)]
 
     def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
-               opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
-        batch_size = len(states)
-        state_keys = [f"{s.information_state_string(pid)}_{pid}_{tuple(b)}_{tuple(stk)}" 
-                      for s, pid, b, stk in zip(states, player_ids, bets, stacks)]
-        cached = [self.cache.__get__(key, None) for key in state_keys]
-        if all(c is not None for c in cached):
-            logging.debug(f"Использован кэш для {batch_size} состояний")
-            return np.array(cached)
+           opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
+    batch_size = len(states)
+    state_keys = [f"{s.information_state_string(pid)}_{pid}_{tuple(b)}_{tuple(stk)}" 
+                  for s, pid, b, stk in zip(states, player_ids, bets, stacks)]
+    cached = [self.cache.__get__(key, None) for key in state_keys]
+    if all(c is not None for c in cached):
+        logging.debug(f"Использован кэш для {batch_size} состояний")
+        return np.array(cached)
 
-        info_states = [s.information_state_tensor(pid) for s, pid in zip(states, player_ids)]
-        cards_batch = [[int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in s.player_cards(pid)] 
-                       for info, s, pid in zip(info_states, states, player_ids)]
-        if random.random() < 0.5:
-            cards_batch = [self.augment_cards(cards) for cards in cards_batch]
-        card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
-        bucket_idxs = self.buckets.predict(card_embs)
-        bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS))
-        bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
+    info_states = [s.information_state_tensor(pid) for s, pid in zip(states, player_ids)]
+    cards_batch = [[int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in s.player_cards(pid)] 
+                   for info, s, pid in zip(info_states, states, player_ids)]
+    if random.random() < 0.5:
+        cards_batch = [self.augment_cards(cards) for cards in cards_batch]
+    card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
+    bucket_idxs = self.buckets.predict(card_embs)
+    bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS))
+    bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
 
-        bets_norm = np.array(bets) / (np.array(stacks) + 1e-8)
-        stacks_norm = np.array(stacks) / 1000.0
-        pots = [sum(b) for b in bets]
-        sprs = [stk[pid] / pot if pot > 0 else 10.0 for stk, pid, pot in zip(stacks, player_ids, pots)]
-        positions = [(pid - s.current_player()) % config.NUM_PLAYERS / config.NUM_PLAYERS for s, pid in zip(states, player_ids)]
+    bets_norm = np.array(bets) / (np.array(stacks) + 1e-8)
+    stacks_norm = np.array(stacks) / 1000.0
+    pots = [sum(b) for b in bets]
+    sprs = [stk[pid] / pot if pot > 0 else 10.0 for stk, pid, pot in zip(stacks, player_ids, pots)]
+    positions = [(pid - s.current_player()) % config.NUM_PLAYERS / config.NUM_PLAYERS for s, pid in zip(states, player_ids)]
 
-        action_history = [([0] * config.NUM_PLAYERS if not hasattr(s, 'action_history') else 
-                          [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) for s in states]
-        action_history = np.array(action_history)
+    action_history = [([0] * config.NUM_PLAYERS if not hasattr(s, 'action_history') else 
+                      [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) for s in states]
+    action_history = np.array(action_history)
 
-        opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
-                           if opponent_stats else [] for pid in player_ids]
-        table_aggs = [np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics]
-        last_bets = [max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
-                     for metrics, pot in zip(opponent_metrics, pots)]
-        all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
-                        for bet, stk, pid in zip(bets, stacks, player_ids)]
+    opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
+                       if opponent_stats else [] for pid in player_ids]
+    table_aggs = [np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics]
+    last_bets = [max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
+                 for metrics, pot in zip(opponent_metrics, pots)]
+    all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
+                    for bet, stk, pid in zip(bets, stacks, player_ids)]
 
-        processed = np.concatenate([
-            bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages),
-            np.array([sprs, table_aggs, positions, last_bets, all_in_flags]).T
-        ], axis=1)
+    processed = np.concatenate([
+        bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages),
+        np.array([sprs, table_aggs, positions, last_bets, all_in_flags]).T
+    ], axis=1)
 
-        if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
-            problematic_idx = np.where(np.isnan(processed) | np.isinf(processed))[0][0]
-            logging.error(f"Invalid state detected: NaN or Inf in processed data\n"
-                          f"State: {states[problematic_idx].information_state_string(player_ids[problematic_idx])}\n"
-                          f"Bets: {bets[problematic_idx]}\nStacks: {stacks[problematic_idx]}\n"
-                          f"Processed row: {processed[problematic_idx]}")
-            raise ValueError("Invalid state processing detected")
+    if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
+        problematic_idx = np.where(np.isnan(processed) | np.isinf(processed))[0][0]
+        logging.error(f"Invalid state detected: NaN or Inf in processed data\n"
+                      f"Batch size: {batch_size}\n"
+                      f"Problematic index: {problematic_idx}\n"
+                      f"State: {states[problematic_idx].information_state_string(player_ids[problematic_idx])}\n"
+                      f"Bets: {bets[problematic_idx]}\nStacks: {stacks[problematic_idx]}\n"
+                      f"Processed row: {processed[problematic_idx]}\n"
+                      f"Card embeddings: {card_embs[problematic_idx]}")
+        raise ValueError("Invalid state processing detected")
 
-        for key, proc in zip(state_keys, processed):
-            self.cache.__set__(key, proc)
-        return processed
+    for key, proc in zip(state_keys, processed):
+        self.cache.__set__(key, proc)
+    return processed
 
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
@@ -833,89 +836,87 @@ class Trainer:
         self.agent.strategy_pool = checkpoint['strategy_pool']
 
     def train(self):
-        try:
-            pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
-            agent_stats = OpponentStats()
+    try:
+        pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
+        agent_stats = OpponentStats()
 
-            def signal_handler(sig, frame):
-                self.interrupted = True
-                self._save_checkpoint(config.MODEL_PATH)
-                ray.shutdown()
-                sys.exit(0)
-
-            signal.signal(signal.SIGINT, signal_handler)
-            signal.signal(signal.SIGTERM, signal_handler)
-
-            if os.path.exists(config.MODEL_PATH):
-                self._load_checkpoint(config.MODEL_PATH)
-
-            try:
-                ray.init(num_gpus=1, num_cpus=config.NUM_WORKERS, ignore_reinit_error=True)
-            except Exception as e:
-                logging.warning(f"Ray initialization failed: {e}, falling back to single-threaded mode")
-                def single_thread_collect():
-                    queue = Queue()
-                    collect_experience(game, self.agent, self.processor, config.STEPS_PER_WORKER * config.NUM_WORKERS, 0, queue)
-                    return [queue.get()]
-                tasks = single_thread_collect
-            else:
-                queues = [Queue() for _ in range(config.NUM_WORKERS)]
-                tasks = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i, queues[i])
-                         for i in range(config.NUM_WORKERS)]
-                results = [q.get() for q in queues]
-
-            for episode in range(self.global_step // config.STEPS_PER_WORKER, config.NUM_EPISODES):
-                results = tasks() if callable(tasks) else tasks
-                for experiences, local_opp_stats, hands_per_sec in results:
-                    if not experiences:
-                        continue
-                    self.buffer.add_batch(experiences, self.processor)
-                    for exp in experiences:
-                        self.reward_normalizer.update(exp[2])
-                        self.global_step += 1
-                        self.agent.global_step = self.global_step
-                        self.buffer.global_step = self.global_step
-                        if exp[5] == 0:
-                            is_blind = exp[5] in [0, 1] and np.argmax(exp[8]) == 0 and sum(exp[6]) <= 0.15
-                            pos = (exp[5] - exp[0].current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
-                            is_raise = any(b > 0 for i, b in enumerate(exp[6]) if i != exp[5])
-                            agent_stats.update(0, exp[1], exp[8], sum(exp[6]), exp[1] if exp[1] > 1 else 0, is_blind, pos, is_raise=is_raise)
-                    self.opponent_stats.stats.update(local_opp_stats.stats)
-                    writer.add_scalar('HandsPerSec', hands_per_sec, self.global_step)
-
-                if len(self.buffer) >= config.BATCH_SIZE:
-                    loss = self._train_step(self.buffer.sample(config.BATCH_SIZE))
-                    logging.info(f"Step {self.global_step} | Loss: {loss:.4f}")
-
-                if self.global_step % config.TEST_INTERVAL == 0:
-                    winrate, exp_score = run_tournament(self.game, self.agent, self.processor)
-                    agent_metrics = agent_stats.get_metrics(0)
-                    writer.add_scalar('Winrate', winrate, self.global_step)
-                    writer.add_scalar('Agent_VPIP', agent_metrics['vpip'], self.global_step)
-                    self.lr_scheduler.step(winrate)
-                    if winrate > self.best_winrate:
-                        self.best_winrate = winrate
-                        self._save_checkpoint(config.BEST_MODEL_PATH, is_best=True)
-
-                if time.time() - self.last_checkpoint_time >= config.CHECKPOINT_INTERVAL:
-                    self._save_checkpoint(config.MODEL_PATH)
-
-                pbar.update(1)
-                if self.interrupted:
-                    break
-
+        def signal_handler(sig, frame):
+            self.interrupted = True
             self._save_checkpoint(config.MODEL_PATH)
             ray.shutdown()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        if os.path.exists(config.MODEL_PATH):
+            self._load_checkpoint(config.MODEL_PATH)
+
+        try:
+            ray.init(num_gpus=1, num_cpus=config.NUM_WORKERS, ignore_reinit_error=True)
+            queues = [Queue() for _ in range(config.NUM_WORKERS)]
+            tasks = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i, queues[i])
+                     for i in range(config.NUM_WORKERS)]
         except Exception as e:
-            error_msg = f"Training crashed: {traceback.format_exc()}\nLast experiences: {experiences[-1] if 'experiences' in locals() else 'N/A'}"
-            logging.error(error_msg)
-            with open(os.path.join(config.LOG_DIR, 'crash_details.txt'), 'a') as f:
-                f.write(f"{time.ctime()}: {error_msg}\n")
-            self._save_checkpoint(os.path.join(config.LOG_DIR, 'crash_recovery.pt'))
-            ray.shutdown()
-            sys.exit(1)
-        pbar.close()
-        writer.close()
+            logging.warning(f"Ray initialization failed: {e}, falling back to single-threaded mode")
+            def single_thread_collect():
+                queue = Queue()
+                collect_experience(self.game, self.agent, self.processor, config.STEPS_PER_WORKER * config.NUM_WORKERS, 0, queue)
+                return [queue.get()]
+            tasks = single_thread_collect
+
+        for episode in range(self.global_step // config.STEPS_PER_WORKER, config.NUM_EPISODES):
+            results = tasks() if callable(tasks) else ray.get(tasks)
+            for experiences, local_opp_stats, hands_per_sec in results:
+                if not experiences:
+                    continue
+                self.buffer.add_batch(experiences, self.processor)
+                for exp in experiences:
+                    self.reward_normalizer.update(exp[2])
+                    self.global_step += 1
+                    self.agent.global_step = self.global_step
+                    self.buffer.global_step = self.global_step
+                    if exp[5] == 0:
+                        is_blind = exp[5] in [0, 1] and np.argmax(exp[8]) == 0 and sum(exp[6]) <= 0.15
+                        pos = (exp[5] - exp[0].current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
+                        is_raise = any(b > 0 for i, b in enumerate(exp[6]) if i != exp[5])
+                        agent_stats.update(0, exp[1], exp[8], sum(exp[6]), exp[1] if exp[1] > 1 else 0, is_blind, pos, is_raise=is_raise)
+                self.opponent_stats.stats.update(local_opp_stats.stats)
+                writer.add_scalar('HandsPerSec', hands_per_sec, self.global_step)
+
+            if len(self.buffer) >= config.BATCH_SIZE:
+                loss = self._train_step(self.buffer.sample(config.BATCH_SIZE))
+                logging.info(f"Step {self.global_step} | Loss: {loss:.4f}")
+
+            if self.global_step % config.TEST_INTERVAL == 0:
+                winrate, exp_score = run_tournament(self.game, self.agent, self.processor)
+                agent_metrics = agent_stats.get_metrics(0)
+                writer.add_scalar('Winrate', winrate, self.global_step)
+                writer.add_scalar('Agent_VPIP', agent_metrics['vpip'], self.global_step)
+                self.lr_scheduler.step(winrate)
+                if winrate > self.best_winrate:
+                    self.best_winrate = winrate
+                    self._save_checkpoint(config.BEST_MODEL_PATH, is_best=True)
+
+            if time.time() - self.last_checkpoint_time >= config.CHECKPOINT_INTERVAL:
+                self._save_checkpoint(config.MODEL_PATH)
+
+            pbar.update(1)
+            if self.interrupted:
+                break
+
+        self._save_checkpoint(config.MODEL_PATH)
+        ray.shutdown()
+    except Exception as e:
+        error_msg = f"Training crashed: {traceback.format_exc()}\nLast experiences: {experiences[-1] if 'experiences' in locals() else 'N/A'}"
+        logging.error(error_msg)
+        with open(os.path.join(config.LOG_DIR, 'crash_details.txt'), 'a') as f:
+            f.write(f"{time.ctime()}: {error_msg}\n")
+        self._save_checkpoint(os.path.join(config.LOG_DIR, 'crash_recovery.pt'))
+        ray.shutdown()
+        sys.exit(1)
+    pbar.close()
+    writer.close()
 
 # ===== ЗАПУСК =====
 if __name__ == "__main__":
