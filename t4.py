@@ -836,8 +836,7 @@ class Trainer:
         self.reward_normalizer.std = np.std(self.reward_normalizer.rewards) + self.reward_normalizer.eps if self.reward_normalizer.rewards else 1
         self.agent.strategy_pool = checkpoint['strategy_pool']
 
-    def train(self):
-    try:
+        def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
         agent_stats = OpponentStats()
 
