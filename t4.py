@@ -27,6 +27,8 @@ import traceback
 from functools import lru_cache
 import argparse
 
+ray.init(num_gpus=1, ignore_reinit_error=True)
+
 # ===== КОНФИГУРАЦИЯ =====
 class Config:
     def __init__(self):
@@ -529,9 +531,20 @@ class PokerAgent(policy.Policy):
             self.strategy_pool = sorted(self.strategy_pool, key=lambda x: x['winrate'], reverse=True)[:10]
 
 # ===== СБОР ДАННЫХ =====
-@ray.remote
+
+@ray.remote(num_gpus=1)  # Изменено: добавлен num_gpus=1 для выделения GPU процессу
 def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps: int, worker_id: int, queue: Queue):
     try:
+        # Добавлено: импорт torch и перенос моделей на правильное устройство
+        import torch
+        if torch.cuda.is_available():
+            agent.regret_net = agent.regret_net.to(device)
+            agent.strategy_net = agent.strategy_net.to(device)
+        else:
+            logging.warning(f"Worker {worker_id}: CUDA not available, falling back to CPU")
+            agent.regret_net = agent.regret_net.to('cpu')
+            agent.strategy_net = agent.strategy_net.to('cpu')
+
         start_time = time.time()
         env = game.new_initial_state()
         agents = [agent] + [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]
@@ -854,7 +867,7 @@ class Trainer:
             self._load_checkpoint(config.MODEL_PATH)
 
         try:
-            ray.init(num_gpus=1, num_cpus=config.NUM_WORKERS, ignore_reinit_error=True)
+            #ray.init(num_gpus=1, num_cpus=config.NUM_WORKERS, ignore_reinit_error=True)
             queues = [Queue() for _ in range(config.NUM_WORKERS)]
             tasks = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i, queues[i])
                      for i in range(config.NUM_WORKERS)]
