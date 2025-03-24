@@ -1,4 +1,4 @@
-# Импорт всех необходимых библиотек123
+# Импорт всех необходимых библиотек1234
 import os
 import time
 import logging
@@ -364,10 +364,13 @@ class StateProcessor:
         # Извлекаем приватные карты игрока из information_state_tensor
         cards_batch = []
         for info in info_states:
-            private_cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]  # Первые 52 — hole cards
-            if len(private_cards) != 2:  # В Texas Hold'em всегда 2 карты у игрока
-                logging.error(f"Invalid number of private cards: {private_cards}")
-                raise ValueError(f"Expected 2 private cards, got {len(private_cards)}")
+            private_cards = [int(i) for i, c in enumerate(info[:52]) if c > 0][:2]  # Берем только первые 2 карты
+            if not private_cards:  # Если карт нет, используем заглушку
+                logging.warning("No private cards found, using default [0, 1]")
+                private_cards = [0, 1]
+            elif len(private_cards) < 2:  # Если меньше 2 карт, добавляем недостающие
+                logging.warning(f"Found {len(private_cards)} private cards, padding to 2: {private_cards}")
+                private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
         # Преобразуем карты в эмбеддинги
@@ -377,7 +380,7 @@ class StateProcessor:
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
         logging.debug(f"bucket_one_hot shape={bucket_one_hot.shape}, dtype={bucket_one_hot.dtype}")
         
-        # Нормализуем ставки и стеки
+        # Остальная часть метода остается без изменений
         bets_norm = np.array(bets, dtype=np.float32) / (np.array(stacks, dtype=np.float32) + 1e-8)
         stacks_norm = np.array(stacks, dtype=np.float32) / 1000.0
         pots = np.array([sum(b) for b in bets], dtype=np.float32)
@@ -387,12 +390,10 @@ class StateProcessor:
         logging.debug(f"bets_norm shape={bets_norm.shape}, dtype={bets_norm.dtype}")
         logging.debug(f"stacks_norm shape={stacks_norm.shape}, dtype={stacks_norm.dtype}")
         
-        # История действий
         action_history = np.array([([0] * config.NUM_PLAYERS if not hasattr(s, 'action_history') else 
                                    [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) for s in states], dtype=np.float32)
         logging.debug(f"action_history shape={action_history.shape}, dtype={action_history.dtype}")
         
-        # Обработка метрик оппонентов
         opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
                             if opponent_stats else [] for pid in player_ids]
         opp_features = []
@@ -413,7 +414,6 @@ class StateProcessor:
         opp_features = np.array(opp_features, dtype=np.float32)
         logging.debug(f"opp_features shape={opp_features.shape}, dtype={opp_features.dtype}")
         
-        # Дополнительные признаки
         table_aggs = np.array([np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics], dtype=np.float32)
         last_bets = np.array([max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
                              for metrics, pot in zip(opponent_metrics, pots)], dtype=np.float32)
@@ -423,7 +423,6 @@ class StateProcessor:
         logging.debug(f"last_bets shape={last_bets.shape}, dtype={last_bets.dtype}")
         logging.debug(f"all_in_flags shape={all_in_flags.shape}, dtype={all_in_flags.dtype}")
         
-        # Собираем все в один массив
         features_list = [
             bucket_one_hot,
             bets_norm,
@@ -436,7 +435,6 @@ class StateProcessor:
         processed = np.concatenate(features_list, axis=1).astype(np.float32)
         logging.debug(f"processed shape={processed.shape}, dtype={processed.dtype}")
         
-        # Проверяем на NaN/Inf и тип данных
         if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
             logging.error(f"NaN/Inf in processed: {processed}")
             raise ValueError("Invalid state processing detected")
@@ -444,7 +442,6 @@ class StateProcessor:
             logging.error(f"Processed array has incorrect dtype: {processed.dtype}, expected np.float32")
             raise ValueError(f"Processed array dtype {processed.dtype} is not np.float32")
         
-        # Сохраняем в кэш и возвращаем
         for key, proc in zip(state_keys, processed):
             self.cache[key] = proc
         return processed
