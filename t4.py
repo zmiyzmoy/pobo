@@ -57,8 +57,6 @@ class Config:
         self.NUM_BUCKETS = 50
         self.BB = 2
         self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2 3 4 5 6,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
-        #self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
-        #self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=2,numRounds=4,blind=1 2,raiseSize=0.10 0.20 0.40 0.80,stack=100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
 # Инициализация
 config = Config()
 os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
@@ -287,17 +285,17 @@ class OpponentStats:
         pos_stats = {pos: self.stats[player_id]['pos_winrate'][pos]['wins'] / max(self.stats[player_id]['pos_winrate'][pos]['hands'], 1)
                      for pos in range(config.NUM_PLAYERS)}
         return {
-            'vpip': self.stats[player_id]['vpip'] / hands,
-            'pfr': self.stats[player_id]['pfr'] / hands,
-            'af': self.stats[player_id]['af'],
-            'fold_freq': self.stats[player_id]['folds'] / hands,
-            'last_bet': self.stats[player_id]['last_bet'],
-            'fold_to_cbet': self.stats[player_id]['fold_to_cbet'] / cbet_opp,
-            'fold_to_3bet': self.stats[player_id]['fold_to_3bet'] / threebet_opp,
-            'check_raise_freq': self.stats[player_id]['check_raise'] / check_opp,
-            'call_vs_raise_freq': self.stats[player_id]['call_vs_raise_freq'] / raise_opp,
-            'street_aggression': [agg / max(hands, 1) for agg in self.stats[player_id]['street_aggression']],
-            'pos_winrate': pos_stats
+            'vpip': float(self.stats[player_id]['vpip'] / hands),
+            'pfr': float(self.stats[player_id]['pfr'] / hands),
+            'af': float(self.stats[player_id]['af']),
+            'fold_freq': float(self.stats[player_id]['folds'] / hands),
+            'last_bet': float(self.stats[player_id]['last_bet']),
+            'fold_to_cbet': float(self.stats[player_id]['fold_to_cbet'] / cbet_opp),
+            'fold_to_3bet': float(self.stats[player_id]['fold_to_3bet'] / threebet_opp),
+            'check_raise_freq': float(self.stats[player_id]['check_raise'] / check_opp),
+            'call_vs_raise_freq': float(self.stats[player_id]['call_vs_raise_freq'] / raise_opp),
+            'street_aggression': [float(agg / max(hands, 1)) for agg in self.stats[player_id]['street_aggression']],
+            'pos_winrate': pos_stats  # Оставляем как словарь, но он не используется в process
         }
 
 # ===== ОБРАБОТКА СОСТОЯНИЙ =====
@@ -376,21 +374,21 @@ class StateProcessor:
 
         opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
                            if opponent_stats else [] for pid in player_ids]
-        # Исправление: Преобразуем opponent_metrics в числовой массив, убираем словари
         table_aggs = [np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics]
         last_bets = [max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
                      for metrics, pot in zip(opponent_metrics, pots)]
         all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
                         for bet, stk, pid in zip(bets, stacks, player_ids)]
-        # Добавляем числовые метрики вместо словарей
+
+        # Исправление: Преобразуем opponent_metrics в числовой массив, убираем словари
         opp_features = []
         for metrics in opponent_metrics:
             if metrics:
-                agg_vpip = np.mean([m['vpip'] for m in metrics])
-                agg_pfr = np.mean([m['pfr'] for m in metrics])
-                agg_fold_to_cbet = np.mean([m['fold_to_cbet'] for m in metrics])
-                agg_fold_to_3bet = np.mean([m['fold_to_3bet'] for m in metrics])
-                agg_street_agg = np.mean([np.mean(m['street_aggression']) for m in metrics])  # Средняя агрессия по улицам
+                agg_vpip = np.mean([float(m['vpip']) for m in metrics])
+                agg_pfr = np.mean([float(m['pfr']) for m in metrics])
+                agg_fold_to_cbet = np.mean([float(m['fold_to_cbet']) for m in metrics])
+                agg_fold_to_3bet = np.mean([float(m['fold_to_3bet']) for m in metrics])
+                agg_street_agg = np.mean([float(np.mean(m['street_aggression'])) for m in metrics])
             else:
                 agg_vpip = 0.5
                 agg_pfr = 0.5
@@ -400,16 +398,13 @@ class StateProcessor:
             opp_features.append([agg_vpip, agg_pfr, agg_fold_to_cbet, agg_fold_to_3bet, agg_street_agg])
         opp_features = np.array(opp_features, dtype=np.float32)
 
-        # Оригинальная строка с проблемой (оставляем для истории):
-        # processed = np.concatenate([
-        #     bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages),
-        #     np.array([sprs, table_aggs, positions, last_bets, all_in_flags]).T
-        # ], axis=1)
-        # Новая версия с числовыми opponent features:
+        # Проверка на нечисловые значения
+        assert all(isinstance(x, (float, np.floating)) for feat in opp_features for x in feat), "Non-numeric values in opp_features"
+
         processed = np.concatenate([
             bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages),
             np.array([sprs, table_aggs, positions, last_bets, all_in_flags]).T,
-            opp_features  # Добавляем числовые метрики оппонентов
+            opp_features
         ], axis=1)
 
         if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
@@ -425,8 +420,7 @@ class StateProcessor:
 
         for key, proc in zip(state_keys, processed):
             self.cache.__set__(key, proc)
-        return processed.astype(np.float32)  # Явно указываем тип для совместимости с PyTorch
-
+        return processed.astype(np.float32)
 
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
@@ -438,7 +432,6 @@ class PokerAgent(policy.Policy):
         self.num_actions = game.num_distinct_actions()
         self.regret_net = RegretNet(processor.state_size, self.num_actions).to(device)
         self.strategy_net = StrategyNet(processor.state_size, self.num_actions).to(device)
-        # Добавляем оптимизатор для regret_net и strategy_net, как требуется для Trainer
         self.optimizer = torch.optim.Adam(
             list(self.regret_net.parameters()) + list(self.strategy_net.parameters()),
             lr=config.LEARNING_RATE
@@ -479,8 +472,6 @@ class PokerAgent(policy.Policy):
             stage_idx = 2  # Терн
         elif num_board_cards == 5:
             stage_idx = 3  # Ривер
-        # Оригинальная строка закомментирована (если была):
-        # stage_idx = state.round()
         is_drawy = len(set([c // 13 for c in board_cards])) < 3 if board_cards else False
 
         if action == 0 and pot > 0:
@@ -536,8 +527,6 @@ class PokerAgent(policy.Policy):
             stage[2] = 1  # Терн
         elif num_board_cards == 5:
             stage[3] = 1  # Ривер
-        # Оригинальная строка закомментирована:
-        # stage = [1 if state.round() == i else 0 for i in range(4)]
         opponent_stats = OpponentStats()
         state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
 
@@ -569,7 +558,6 @@ class PokerAgent(policy.Policy):
             state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
             q_value = self.strategy_net(state_tensor).max().item()
             last_opp_bet = max([opponent_stats.get_metrics(i)['last_bet'] for i in range(config.NUM_PLAYERS) if i != player_id], default=0)
-            # Используем переданный stage вместо state.round()
             bet_size = self._dynamic_bet_size(state, stacks, bets, player_id, opponent_stats.get_metrics(player_id), q_value, stage, last_opp_bet)
             if bet_size >= stacks[player_id] and 4 in state.legal_actions(player_id):
                 action = 4
@@ -629,18 +617,13 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 
             player_id = env.current_player()
             if player_id < 0:
-                # Обработка "chance node" (узел шанса, где раздаются карты)
                 legal_actions = env.legal_actions()
-                action = random.choice(legal_actions)  # Выбираем случайное действие (например, ACTION_DEAL)
+                action = random.choice(legal_actions)
                 next_state = env.clone()
                 next_state.apply_action(action)
                 env = next_state
                 logging.debug(f"Worker {worker_id}: Chance node at step {step}, player_id={player_id}, action={action}, new_state={env.__str__()}")
-                continue  # Переходим к следующему шагу, так как это не действие игрока
-                # Оригинальная обработка ошибки закомментирована:
-                # logging.error(f"Worker {worker_id}: Invalid player_id {player_id} detected at step {step}, state={env.__str__()}, legal_actions={env.legal_actions()}")
-                # queue.put(([], OpponentStats(), 0))
-                # return ([], OpponentStats(), 0)
+                continue
 
             bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
@@ -692,10 +675,8 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(pyspiel.Policy):
     def __init__(self, game):
-        # Исправляем вызов базового конструктора: передаём только game (уже исправлено, но подтверждаем)
-        super().__init__(game)
-        # Оригинальная строка закомментирована для истории:
-        # super().__init__(game, list(range(game.num_players())))  # Передаём всех игроков (0-5 для 6 игроков)
+        # Исправление: Передаём game и player_ids в базовый конструктор
+        super().__init__(game, list(range(game.num_players())))
         self.game = game
 
     def _hand_strength(self, state, player_id: int) -> float:
@@ -714,7 +695,6 @@ class TightAggressiveAgent(pyspiel.Policy):
         if not legal_actions:
             return {0: 1.0}
         strength = self._hand_strength(state, player_id)
-        # Исправление: Заменяем state.round() на определение стадии по количеству карт
         info_tensor = state.information_state_tensor(player_id)
         board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
         num_board_cards = len(board_cards)
@@ -727,8 +707,6 @@ class TightAggressiveAgent(pyspiel.Policy):
             stage = 2  # Терн
         elif num_board_cards == 5:
             stage = 3  # Ривер
-        # Оригинальная строка закомментирована:
-        # stage = state.round()
         bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
         pot = sum(bets)
         probs = {a: 0.0 for a in legal_actions}
@@ -802,7 +780,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             player_id = state.current_player()
             bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
             stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-            # Исправление: Заменяем state.round() на определение стадии по количеству карт
             info_tensor = state.information_state_tensor(player_id)
             board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
@@ -815,8 +792,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
                 stage[2] = 1  # Терн
             elif num_board_cards == 5:
                 stage[3] = 1  # Ривер
-            # Оригинальная строка закомментирована:
-            # stage = [1 if state.round() == i else 0 for i in range(4)]
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else opponents[player_id - 1].step(state, player_id, bets, stacks, stage, opponent_stats)
             state.apply_action(action)
@@ -830,7 +805,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             player_id = state.current_player()
             bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
             stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-            # Исправление: Заменяем state.round() на определение стадии по количеству карт
             info_tensor = state.information_state_tensor(player_id)
             board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
@@ -843,8 +817,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
                 stage[2] = 1  # Терн
             elif num_board_cards == 5:
                 stage[3] = 1  # Ривер
-            # Оригинальная строка закомментирована:
-            # stage = [1 if state.round() == i else 0 for i in range(4)]
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(tag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: tag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
             state.apply_action(action)
@@ -858,7 +830,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             player_id = state.current_player()
             bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
             stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-            # Исправление: Заменяем state.round() на определение стадии по количеству карт
             info_tensor = state.information_state_tensor(player_id)
             board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
@@ -871,8 +842,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
                 stage[2] = 1  # Терн
             elif num_board_cards == 5:
                 stage[3] = 1  # Ривер
-            # Оригинальная строка закомментирована:
-            # stage = [1 if state.round() == i else 0 for i in range(4)]
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(lag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: lag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
             state.apply_action(action)
@@ -885,7 +854,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             player_id = state.current_player()
             bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
             stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-            # Исправление: Заменяем state.round() на определение стадии по количеству карт
             info_tensor = state.information_state_tensor(player_id)
             board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
@@ -898,8 +866,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
                 stage[2] = 1  # Терн
             elif num_board_cards == 5:
                 stage[3] = 1  # Ривер
-            # Оригинальная строка закомментирована:
-            # stage = [1 if state.round() == i else 0 for i in range(4)]
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else random.choice(state.legal_actions(player_id))
             state.apply_action(action)
@@ -913,7 +879,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             player_id = state.current_player()
             bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
             stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-            # Исправление: Заменяем state.round() на определение стадии по количеству карт
             info_tensor = state.information_state_tensor(player_id)
             board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
@@ -926,8 +891,6 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
                 stage[2] = 1  # Терн
             elif num_board_cards == 5:
                 stage[3] = 1  # Ривер
-            # Оригинальная строка закомментирована:
-            # stage = [1 if state.round() == i else 0 for i in range(4)]
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else cfr_agent.action(state, player_id)
             state.apply_action(action)
@@ -1080,9 +1043,6 @@ class Trainer:
             self._save_checkpoint(config.MODEL_PATH)
             ray.shutdown()
         except Exception as e:
-            # Оригинальная строка с потенциальной ошибкой закомментирована
-            # error_msg = f"Training crashed: {traceback.format_exc()}\nLast experiences: {experiences[-1] if 'experiences' in locals() else 'N/A'}"
-            # Новая версия с проверкой на наличие experiences
             last_exp = experiences[-1] if 'experiences' in locals() and experiences else 'N/A'
             error_msg = f"Training crashed: {traceback.format_exc()}\nLast experiences: {last_exp}"
             logging.error(error_msg)
