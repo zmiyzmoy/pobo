@@ -648,7 +648,7 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
             
             info_tensor = env.information_state_tensor(player_id)
-            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+            board_cards = [int(i) for i, c in enumerate(info_tensor[52:104]) if c > 0]  # Общие карты (52-104)
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
@@ -690,22 +690,23 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
     except Exception as e:
         logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: Not available (terminal state issue)\nBets: {locals().get('bets', 'N/A')}\nStacks: {locals().get('stacks', 'N/A')}")
         queue.put(([], OpponentStats(), 0))
-        torch.cuda.empty_cache()  # Очищаем память GPU
+        torch.cuda.empty_cache()
         return ([], OpponentStats(), 0)
     finally:
-        torch.cuda.empty_cache()  # Очищаем память GPU
-        ray.shutdown()  # Завершаем Ray для этого воркера
-
+        torch.cuda.empty_cache()
+        ray.shutdown()
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(pyspiel.Policy):
     def __init__(self, game):
-        super().__init__()  # Вызываем базовый конструктор без аргументов
+        super().__init__()
         self.game = game
-        self.player_ids = list(range(game.num_players()))  # Сохраняем список игроков, если нужно
+        self.player_ids = list(range(game.num_players()))
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
-        cards = [int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in state.player_cards(player_id)]
+        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]  # Первые 52 — hole cards
+        if len(cards) != 2:
+            return 0.1
         ranks = sorted([c % 13 for c in cards], reverse=True)
         is_suited = len(set([c // 13 for c in cards])) == 1
         if len(ranks) < 2:
@@ -720,17 +721,17 @@ class TightAggressiveAgent(pyspiel.Policy):
             return {0: 1.0}
         strength = self._hand_strength(state, player_id)
         info_tensor = state.information_state_tensor(player_id)
-        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+        board_cards = [int(c) for i, c in enumerate(info_tensor[52:104]) if c > 0]
         num_board_cards = len(board_cards)
-        stage = 0  # По умолчанию префлоп
+        stage = 0
         if num_board_cards == 0:
-            stage = 0  # Префлоп
+            stage = 0
         elif num_board_cards == 3:
-            stage = 1  # Флоп
+            stage = 1
         elif num_board_cards == 4:
-            stage = 2  # Терн
+            stage = 2
         elif num_board_cards == 5:
-            stage = 3  # Ривер
+            stage = 3
         bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
         pot = sum(bets)
         probs = {a: 0.0 for a in legal_actions}
@@ -750,12 +751,14 @@ class TightAggressiveAgent(pyspiel.Policy):
 
 class LooseAggressiveAgent(policy.Policy):
     def __init__(self, game):
-        super().__init__(game, list(range(game.num_players())))  # Добавляем player_ids
+        super().__init__(game, list(range(game.num_players())))
         self.game = game
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
-        cards = [int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in state.player_cards(player_id)]
+        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]  # Первые 52 — hole cards
+        if len(cards) != 2:
+            return 0.1
         ranks = sorted([c % 13 for c in cards], reverse=True)
         is_suited = len(set([c // 13 for c in cards])) == 1
         if len(ranks) < 2:
@@ -947,24 +950,27 @@ class Trainer:
         self.opponent_stats = OpponentStats()
 
     def _train_step(self, batch):
-        states, actions, rewards, next_states, dones, priorities = batch
+        samples, indices, weights = batch  # Распаковываем результат sample
+        states, actions, rewards, next_states, dones, _, _, _, _ = zip(*samples)  # Извлекаем нужные элементы из samples
+    
         states = torch.tensor(states, dtype=torch.float32, device=device)
         actions = torch.tensor(actions, dtype=torch.long, device=device)
         rewards = torch.tensor([self.reward_normalizer.normalize(r) for r in rewards], dtype=torch.float32, device=device)
         next_states = torch.tensor(next_states, dtype=torch.float32, device=device)
         dones = torch.tensor(dones, dtype=torch.float32, device=device)
-
+        weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    
         self.agent.optimizer.zero_grad()
         q_values = self.agent.regret_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         next_q_values = self.agent.strategy_net(next_states).max(1)[0]
         targets = rewards + config.GAMMA * next_q_values * (1 - dones)
-        loss = ((priorities * (q_values - targets.detach())) ** 2).mean()
+        loss = (weights * (q_values - targets.detach()) ** 2).mean()  # Используем weights вместо priorities
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.agent.regret_net.parameters(), config.GRAD_CLIP_VALUE)
         self.agent.optimizer.step()
-
+    
         new_priorities = torch.abs(q_values - targets).detach().cpu().numpy() + 1e-5
-        self.buffer.update_priorities(new_priorities)
+        self.buffer.update_priorities(indices, new_priorities)  # Передаем indices
         return loss.item()
 
     def _save_checkpoint(self, path, is_best=False):
