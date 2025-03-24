@@ -1,4 +1,4 @@
-# Импорт всех необходимых библиотек2
+# Импорт всех необходимых библиотек
 import os
 import time
 import logging
@@ -301,7 +301,6 @@ class OpponentStats:
         }
 
 # ===== ОБРАБОТКА СОСТОЯНИЙ =====
-# ===== ОБРАБОТКА СОСТОЯНИЙ =====
 class StateProcessor:
     def __init__(self):
         self.card_embedding = CardEmbedding().to(device)
@@ -420,6 +419,7 @@ class StateProcessor:
         for key, proc in zip(state_keys, processed):
             self.cache.__set__(key, proc)
         return processed
+
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor: StateProcessor):
@@ -723,6 +723,7 @@ class TightAggressiveAgent(pyspiel.Policy):
             probs[0] = 0.7 if pot > 0 else 0.3
             probs[1] = 1.0 - probs[0]
         return probs
+
 class LooseAggressiveAgent(policy.Policy):
     def __init__(self, game):
         super().__init__(game, list(range(game.num_players())))  # Добавляем player_ids
