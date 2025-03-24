@@ -345,87 +345,80 @@ class StateProcessor:
             return [r + suit_mapping[s] * 13 for r, s in zip(original_ranks, original_suits)]
 
     def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
-                opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
-        batch_size = len(states)
-        state_keys = [f"{s.information_state_string(pid)}_{pid}_{tuple(b)}_{tuple(stk)}" 
-                      for s, pid, b, stk in zip(states, player_ids, bets, stacks)]
-        cached = [self.cache.__get__(key, None) for key in state_keys]
-        if all(c is not None for c in cached):
-            logging.debug(f"Использован кэш для {batch_size} состояний")
-            return np.array(cached)
+            opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
+    batch_size = len(states)
+    # Формируем ключи для кэша
+    state_keys = [f"{s.information_state_string(pid)}_{pid}_{tuple(b)}_{tuple(stk)}" 
+                  for s, pid, b, stk in zip(states, player_ids, bets, stacks)]
+    cached = [self.cache.__get__(key, None) for key in state_keys]
+    if all(c is not None for c in cached):
+        return np.array(cached)
 
-        info_states = [s.information_state_tensor(pid) for s, pid in zip(states, player_ids)]
-        cards_batch = [[int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in s.player_cards(pid)] 
-                       for info, s, pid in zip(info_states, states, player_ids)]
-        if random.random() < 0.5:
-            cards_batch = [self.augment_cards(cards) for cards in cards_batch]
-        card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
-        bucket_idxs = self.buckets.predict(card_embs)
-        bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS))
-        bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
+    # Преобразуем состояния в тензоры
+    info_states = [s.information_state_tensor(pid) for s, pid in zip(states, player_ids)]
+    cards_batch = [[int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in s.player_cards(pid)] 
+                   for info, s, pid in zip(info_states, states, player_ids)]
+    card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
+    bucket_idxs = self.buckets.predict(card_embs)
+    bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
+    bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
 
-        bets_norm = np.array(bets) / (np.array(stacks) + 1e-8)
-        stacks_norm = np.array(stacks) / 1000.0
-        pots = [sum(b) for b in bets]
-        sprs = [stk[pid] / pot if pot > 0 else 10.0 for stk, pid, pot in zip(stacks, player_ids, pots)]
-        positions = [(pid - s.current_player()) % config.NUM_PLAYERS / config.NUM_PLAYERS for s, pid in zip(states, player_ids)]
+    # Нормализуем ставки и стеки
+    bets_norm = np.array(bets, dtype=np.float32) / (np.array(stacks, dtype=np.float32) + 1e-8)
+    stacks_norm = np.array(stacks, dtype=np.float32) / 1000.0
+    pots = [sum(b) for b in bets]
+    sprs = [stk[pid] / pot if pot > 0 else 10.0 for stk, pid, pot in zip(stacks, player_ids, pots)]
+    positions = [(pid - s.current_player()) % config.NUM_PLAYERS / config.NUM_PLAYERS 
+                 for s, pid in zip(states, player_ids)]
 
-        action_history = [([0] * config.NUM_PLAYERS if not hasattr(s, 'action_history') else 
-                          [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) for s in states]
-        action_history = np.array(action_history)
+    # История действий
+    action_history = [([0] * config.NUM_PLAYERS if not hasattr(s, 'action_history') else 
+                      [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) for s in states]
+    action_history = np.array(action_history, dtype=np.float32)
 
-        opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
-                           if opponent_stats else [] for pid in player_ids]
-        table_aggs = [np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics]
-        last_bets = [max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
-                     for metrics, pot in zip(opponent_metrics, pots)]
-        all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
-                        for bet, stk, pid in zip(bets, stacks, player_ids)]
+    # Обработка метрик оппонентов
+    opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
+                       if opponent_stats else [] for pid in player_ids]
+    opp_features = []
+    for metrics in opponent_metrics:
+        if metrics:
+            agg_vpip = float(np.mean([float(m['vpip']) for m in metrics]))
+            agg_pfr = float(np.mean([float(m['pfr']) for m in metrics]))
+            agg_fold_to_cbet = float(np.mean([float(m['fold_to_cbet']) for m in metrics]))
+            agg_fold_to_3bet = float(np.mean([float(m['fold_to_3bet']) for m in metrics]))
+            agg_street_agg = float(np.mean([float(np.mean(m['street_aggression'])) for m in metrics]))
+        else:
+            agg_vpip = 0.5
+            agg_pfr = 0.5
+            agg_fold_to_cbet = 0.5
+            agg_fold_to_3bet = 0.5
+            agg_street_agg = 0.5
+        opp_features.append([agg_vpip, agg_pfr, agg_fold_to_cbet, agg_fold_to_3bet, agg_street_agg])
+    opp_features = np.array(opp_features, dtype=np.float32)
 
-        # Формируем opp_features только из числовых данных
-        opp_features = []
-        for metrics in opponent_metrics:
-            if metrics:
-                # Используем только числовые метрики
-                agg_vpip = float(np.mean([float(m['vpip']) for m in metrics]))
-                agg_pfr = float(np.mean([float(m['pfr']) for m in metrics]))
-                agg_fold_to_cbet = float(np.mean([float(m['fold_to_cbet']) for m in metrics]))
-                agg_fold_to_3bet = float(np.mean([float(m['fold_to_3bet']) for m in metrics]))
-                agg_street_agg = float(np.mean([float(np.mean(m['street_aggression'])) for m in metrics]))
-            else:
-                # Значения по умолчанию, если данных нет
-                agg_vpip = 0.5
-                agg_pfr = 0.5
-                agg_fold_to_cbet = 0.5
-                agg_fold_to_3bet = 0.5
-                agg_street_agg = 0.5
-            opp_features.append([agg_vpip, agg_pfr, agg_fold_to_cbet, agg_fold_to_3bet, agg_street_agg])
-        opp_features = np.array(opp_features, dtype=np.float32)
+    # Дополнительные признаки
+    table_aggs = [np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics]
+    last_bets = [max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
+                 for metrics, pot in zip(opponent_metrics, pots)]
+    all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
+                    for bet, stk, pid in zip(bets, stacks, player_ids)]
 
-        # Проверка на нечисловые значения
-        assert all(isinstance(x, (float, np.floating)) for feat in opp_features for x in feat), "Non-numeric values in opp_features"
+    # Собираем все в один массив
+    processed = np.concatenate([
+        bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages, dtype=np.float32),
+        np.array([sprs, table_aggs, positions, last_bets, all_in_flags], dtype=np.float32).T,
+        opp_features
+    ], axis=1)
 
-        # Конкатенация всех числовых массивов
-        processed = np.concatenate([
-            bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages),
-            np.array([sprs, table_aggs, positions, last_bets, all_in_flags]).T,
-            opp_features
-        ], axis=1)
+    # Проверяем на NaN/Inf
+    if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
+        logging.error(f"NaN/Inf in processed: {processed}")
+        raise ValueError("Invalid state processing detected")
 
-        if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
-            problematic_idx = np.where(np.isnan(processed) | np.isinf(processed))[0][0]
-            logging.error(f"Invalid state detected: NaN or Inf in processed data\n"
-                          f"Batch size: {batch_size}\n"
-                          f"Problematic index: {problematic_idx}\n"
-                          f"State: {states[problematic_idx].information_state_string(player_ids[problematic_idx])}\n"
-                          f"Bets: {bets[problematic_idx]}\nStacks: {stacks[problematic_idx]}\n"
-                          f"Processed row: {processed[problematic_idx]}\n"
-                          f"Card embeddings: {card_embs[problematic_idx]}")
-            raise ValueError("Invalid state processing detected")
-
-        for key, proc in zip(state_keys, processed):
-            self.cache.__set__(key, proc)
-        return processed.astype(np.float32)
+    # Сохраняем в кэш и возвращаем
+    for key, proc in zip(state_keys, processed):
+        self.cache.__set__(key, proc)
+    return processed
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor: StateProcessor):
@@ -731,7 +724,7 @@ class TightAggressiveAgent(pyspiel.Policy):
         return probs
 class LooseAggressiveAgent(policy.Policy):
     def __init__(self, game):
-        super().__init__(game)
+        super().__init__(game, list(range(game.num_players())))  # Добавляем player_ids
         self.game = game
 
     def _hand_strength(self, state, player_id: int) -> float:
