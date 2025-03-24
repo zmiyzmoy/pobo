@@ -1,4 +1,4 @@
-# Импорт всех необходимых библиотек6
+# Импорт всех необходимых библиотек
 import os
 import time
 import logging
@@ -27,8 +27,6 @@ import traceback
 from functools import lru_cache
 import argparse
 
-ray.init(num_gpus=1, ignore_reinit_error=True)
-
 # ===== КОНФИГУРАЦИЯ =====
 class Config:
     def __init__(self):
@@ -41,19 +39,19 @@ class Config:
         self.BEST_MODEL_PATH = os.path.join(self.BASE_DIR, 'models', 'psro_best.pt')
         self.LOG_DIR = os.path.join(self.BASE_DIR, 'logs')
         self.KMEANS_PATH = os.path.join(self.BASE_DIR, 'models', 'kmeans.joblib')
-        self.NUM_EPISODES = 1  # Для теста, увеличьте до 50 для A100
-        self.BATCH_SIZE = 512  # Увеличьте до 2048 для A100
+        self.NUM_EPISODES = 1  # Для теста
+        self.BATCH_SIZE = 128  # Уменьшено с 512 для стабильности
         self.GAMMA = 0.96
-        self.BUFFER_CAPACITY = 100_000  # Увеличьте до 1M для A100
-        self.NUM_WORKERS = 1  # Увеличьте до 8 для A100
-        self.STEPS_PER_WORKER = 1000  # Увеличьте до 2500 для 1M рук
+        self.BUFFER_CAPACITY = 10_000  # Уменьшено с 100_000 для снижения нагрузки
+        self.NUM_WORKERS = 1  # Оставляем для теста
+        self.STEPS_PER_WORKER = 1000
         self.SELFPLAY_UPDATE_FREQ = 500
         self.LOG_FREQ = 100
         self.TEST_INTERVAL = 500
         self.LEARNING_RATE = 1e-4
         self.NUM_PLAYERS = 6
         self.GRAD_CLIP_VALUE = 5.0
-        self.CHECKPOINT_INTERVAL = 300  # 3600 для A100
+        self.CHECKPOINT_INTERVAL = 300
         self.NUM_BUCKETS = 50
         self.BB = 2
         self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2 3 4 5 6,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
@@ -63,7 +61,7 @@ config = Config()
 os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
 os.makedirs(config.LOG_DIR, exist_ok=True)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,  # Меняем на INFO для меньшего объема логов, но оставляем DEBUG внутри process
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(os.path.join(config.LOG_DIR, 'training.log')),
@@ -285,7 +283,6 @@ class OpponentStats:
         raise_opp = max(self.stats[player_id]['raise_opp'], 1)
         pos_stats = {pos: self.stats[player_id]['pos_winrate'][pos]['wins'] / max(self.stats[player_id]['pos_winrate'][pos]['hands'], 1)
                      for pos in range(config.NUM_PLAYERS)}
-        # Исправление: Явное приведение всех значений к float
         return {
             'vpip': float(self.stats[player_id]['vpip'] / hands),
             'pfr': float(self.stats[player_id]['pfr'] / hands),
@@ -297,7 +294,7 @@ class OpponentStats:
             'check_raise_freq': float(self.stats[player_id]['check_raise'] / check_opp),
             'call_vs_raise_freq': float(self.stats[player_id]['call_vs_raise_freq'] / raise_opp),
             'street_aggression': [float(agg / max(hands, 1)) for agg in self.stats[player_id]['street_aggression']],
-            'pos_winrate': pos_stats  # Оставляем как словарь, но он не используется в process
+            'pos_winrate': pos_stats
         }
 
 # ===== ОБРАБОТКА СОСТОЯНИЙ =====
@@ -306,7 +303,7 @@ class StateProcessor:
         self.card_embedding = CardEmbedding().to(device)
         self.buckets = self._load_or_precompute_buckets()
         self.state_size = config.NUM_BUCKETS + config.NUM_PLAYERS * 3 + 4 + 5
-        self.cache = {}  # Явный словарь вместо lru_cache
+        self.cache = {}
         logging.info("StateProcessor инициализирован")
 
     def _load_or_precompute_buckets(self):
@@ -356,6 +353,7 @@ class StateProcessor:
         # Проверяем кэш
         cached = [self.cache.get(key) for key in state_keys]
         if all(c is not None for c in cached):
+            logging.debug("Returning cached data")
             return np.array(cached, dtype=np.float32)
         
         # Преобразуем состояния в тензоры
@@ -365,22 +363,22 @@ class StateProcessor:
         cards_batch = []
         for info in info_states:
             private_cards = [int(i) for i, c in enumerate(info[:52]) if c > 0][:2]  # Берем только первые 2 карты
-            if not private_cards:  # Если карт нет, используем заглушку
+            if not private_cards:
                 logging.warning("No private cards found, using default [0, 1]")
                 private_cards = [0, 1]
-            elif len(private_cards) < 2:  # Если меньше 2 карт, добавляем недостающие
+            elif len(private_cards) < 2:
                 logging.warning(f"Found {len(private_cards)} private cards, padding to 2: {private_cards}")
                 private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
         # Преобразуем карты в эмбеддинги с явным указанием float32
         card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy().astype(np.float32)
+        logging.debug(f"card_embs dtype before predict: {card_embs.dtype}, shape: {card_embs.shape}")
         bucket_idxs = self.buckets.predict(card_embs)
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
         logging.debug(f"bucket_one_hot shape={bucket_one_hot.shape}, dtype={bucket_one_hot.dtype}")
         
-        # Остальная часть метода без изменений
         bets_norm = np.array(bets, dtype=np.float32) / (np.array(stacks, dtype=np.float32) + 1e-8)
         stacks_norm = np.array(stacks, dtype=np.float32) / 1000.0
         pots = np.array([sum(b) for b in bets], dtype=np.float32)
@@ -442,9 +440,12 @@ class StateProcessor:
             logging.error(f"Processed array has incorrect dtype: {processed.dtype}, expected np.float32")
             raise ValueError(f"Processed array dtype {processed.dtype} is not np.float32")
         
+        self.cache.clear()  # Очищаем кэш перед сохранением новых данных
         for key, proc in zip(state_keys, processed):
             self.cache[key] = proc
+        logging.debug("Processed data cached and returned")
         return processed
+
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor: StateProcessor):
@@ -482,19 +483,18 @@ class PokerAgent(policy.Policy):
         pot = sum(bets)
         opp_metrics = [opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != player_id]
         hand_strength = self._hand_strength(state, player_id)
-        # Используем stage_idx из количества карт вместо state.round()
         info_tensor = state.information_state_tensor(player_id)
         board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
         num_board_cards = len(board_cards)
-        stage_idx = 0  # По умолчанию префлоп
+        stage_idx = 0
         if num_board_cards == 0:
-            stage_idx = 0  # Префлоп
+            stage_idx = 0
         elif num_board_cards == 3:
-            stage_idx = 1  # Флоп
+            stage_idx = 1
         elif num_board_cards == 4:
-            stage_idx = 2  # Терн
+            stage_idx = 2
         elif num_board_cards == 5:
-            stage_idx = 3  # Ривер
+            stage_idx = 3
         is_drawy = len(set([c // 13 for c in board_cards])) < 3 if board_cards else False
 
         if action == 0 and pot > 0:
@@ -537,20 +537,18 @@ class PokerAgent(policy.Policy):
         info_state = state.information_state_string(player_id)
         bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
         stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-        # Определяем стадию по количеству карт на столе вместо round()
         info_tensor = state.information_state_tensor(player_id)
         board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
         num_board_cards = len(board_cards)
         stage = [0] * 4
         if num_board_cards == 0:
-            stage[0] = 1  # Префлоп
+            stage[0] = 1
         elif num_board_cards == 3:
-            stage[1] = 1  # Флоп
+            stage[1] = 1
         elif num_board_cards == 4:
-            stage[2] = 1  # Терн
+            stage[2] = 1
         elif num_board_cards == 5:
-            stage[3] = 1  # Ривер
-        # Используем переданный opponent_stats или создаем пустой, если его нет
+            stage[3] = 1
         opponent_stats = opponent_stats if opponent_stats is not None else OpponentStats()
         state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
     
@@ -576,7 +574,7 @@ class PokerAgent(policy.Policy):
 
     def step(self, state, player_id: int, bets: List[float], stacks: List[float], stage: List[int], opponent_stats: OpponentStats) -> int:
         epsilon = max(0.1, 1.0 - self.global_step / 100000)
-        probs = self.action_probabilities(state, player_id, opponent_stats)  # Передаем opponent_stats
+        probs = self.action_probabilities(state, player_id, opponent_stats)
         action = random.choice(list(probs.keys())) if random.random() < epsilon else max(probs, key=probs.get)
         if action > 1:
             state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
@@ -654,17 +652,17 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
             
             info_tensor = env.information_state_tensor(player_id)
-            board_cards = [int(i) for i, c in enumerate(info_tensor[52:104]) if c > 0]  # Общие карты (52-104)
+            board_cards = [int(i) for i, c in enumerate(info_tensor[52:104]) if c > 0]
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
-                stage[0] = 1  # Префлоп
+                stage[0] = 1
             elif num_board_cards == 3:
-                stage[1] = 1  # Флоп
+                stage[1] = 1
             elif num_board_cards == 4:
-                stage[2] = 1  # Терн
+                stage[2] = 1
             elif num_board_cards == 5:
-                stage[3] = 1  # Ривер
+                stage[3] = 1
 
             is_blind = player_id in [0, 1] and num_board_cards == 0 and sum(bets) <= 0.15
             position = (player_id - env.current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
@@ -700,7 +698,7 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         return ([], OpponentStats(), 0)
     finally:
         torch.cuda.empty_cache()
-        ray.shutdown()
+
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(pyspiel.Policy):
     def __init__(self, game):
@@ -710,7 +708,7 @@ class TightAggressiveAgent(pyspiel.Policy):
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
-        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]  # Первые 52 — hole cards
+        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]
         if len(cards) != 2:
             return 0.1
         ranks = sorted([c % 13 for c in cards], reverse=True)
@@ -762,7 +760,7 @@ class LooseAggressiveAgent(policy.Policy):
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
-        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]  # Первые 52 — hole cards
+        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]
         if len(cards) != 2:
             return 0.1
         ranks = sorted([c % 13 for c in cards], reverse=True)
@@ -818,13 +816,13 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
-                stage[0] = 1  # Префлоп
+                stage[0] = 1
             elif num_board_cards == 3:
-                stage[1] = 1  # Флоп
+                stage[1] = 1
             elif num_board_cards == 4:
-                stage[2] = 1  # Терн
+                stage[2] = 1
             elif num_board_cards == 5:
-                stage[3] = 1  # Ривер
+                stage[3] = 1
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else opponents[player_id - 1].step(state, player_id, bets, stacks, stage, opponent_stats)
             state.apply_action(action)
@@ -843,13 +841,13 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
-                stage[0] = 1  # Префлоп
+                stage[0] = 1
             elif num_board_cards == 3:
-                stage[1] = 1  # Флоп
+                stage[1] = 1
             elif num_board_cards == 4:
-                stage[2] = 1  # Терн
+                stage[2] = 1
             elif num_board_cards == 5:
-                stage[3] = 1  # Ривер
+                stage[3] = 1
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(tag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: tag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
             state.apply_action(action)
@@ -868,13 +866,13 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
-                stage[0] = 1  # Префлоп
+                stage[0] = 1
             elif num_board_cards == 3:
-                stage[1] = 1  # Флоп
+                stage[1] = 1
             elif num_board_cards == 4:
-                stage[2] = 1  # Терн
+                stage[2] = 1
             elif num_board_cards == 5:
-                stage[3] = 1  # Ривер
+                stage[3] = 1
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(lag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: lag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
             state.apply_action(action)
@@ -892,13 +890,13 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
-                stage[0] = 1  # Префлоп
+                stage[0] = 1
             elif num_board_cards == 3:
-                stage[1] = 1  # Флоп
+                stage[1] = 1
             elif num_board_cards == 4:
-                stage[2] = 1  # Терн
+                stage[2] = 1
             elif num_board_cards == 5:
-                stage[3] = 1  # Ривер
+                stage[3] = 1
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else random.choice(state.legal_actions(player_id))
             state.apply_action(action)
@@ -917,13 +915,13 @@ def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
-                stage[0] = 1  # Префлоп
+                stage[0] = 1
             elif num_board_cards == 3:
-                stage[1] = 1  # Флоп
+                stage[1] = 1
             elif num_board_cards == 4:
-                stage[2] = 1  # Терн
+                stage[2] = 1
             elif num_board_cards == 5:
-                stage[3] = 1  # Ривер
+                stage[3] = 1
             opponent_stats = OpponentStats()
             action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else cfr_agent.action(state, player_id)
             state.apply_action(action)
@@ -956,8 +954,8 @@ class Trainer:
         self.opponent_stats = OpponentStats()
 
     def _train_step(self, batch):
-        samples, indices, weights = batch  # Распаковываем результат sample
-        states, actions, rewards, next_states, dones, _, _, _, _ = zip(*samples)  # Извлекаем нужные элементы из samples
+        samples, indices, weights = batch
+        states, actions, rewards, next_states, dones, _, _, _, _ = zip(*samples)
     
         states = torch.tensor(states, dtype=torch.float32, device=device)
         actions = torch.tensor(actions, dtype=torch.long, device=device)
@@ -970,13 +968,13 @@ class Trainer:
         q_values = self.agent.regret_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         next_q_values = self.agent.strategy_net(next_states).max(1)[0]
         targets = rewards + config.GAMMA * next_q_values * (1 - dones)
-        loss = (weights * (q_values - targets.detach()) ** 2).mean()  # Используем weights вместо priorities
+        loss = (weights * (q_values - targets.detach()) ** 2).mean()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.agent.regret_net.parameters(), config.GRAD_CLIP_VALUE)
         self.agent.optimizer.step()
     
         new_priorities = torch.abs(q_values - targets).detach().cpu().numpy() + 1e-5
-        self.buffer.update_priorities(indices, new_priorities)  # Передаем indices
+        self.buffer.update_priorities(indices, new_priorities)
         return loss.item()
 
     def _save_checkpoint(self, path, is_best=False):
@@ -1010,7 +1008,7 @@ class Trainer:
         def signal_handler(sig, frame):
             self.interrupted = True
             self._save_checkpoint(config.MODEL_PATH)
-            ray.shutdown()  # Завершаем Ray при прерывании
+            ray.shutdown()
             sys.exit(0)
     
         signal.signal(signal.SIGINT, signal_handler)
@@ -1021,7 +1019,9 @@ class Trainer:
     
         try:
             queues = [Queue() for _ in range(config.NUM_WORKERS)]
+            ray.init(num_gpus=1, ignore_reinit_error=True)  # Инициализация Ray один раз
             for episode in range(self.global_step // config.STEPS_PER_WORKER, config.NUM_EPISODES):
+                logging.info(f"Starting episode {episode}")
                 tasks = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i, queues[i])
                          for i in range(config.NUM_WORKERS)]
                 results = ray.get(tasks)
@@ -1031,6 +1031,7 @@ class Trainer:
     
                 for experiences, local_opp_stats, hands_per_sec in results:
                     if not experiences:
+                        logging.warning(f"Episode {episode}: No experiences collected")
                         continue
                     self.buffer.add_batch(experiences, self.processor)
                     for exp in experiences:
@@ -1064,13 +1065,13 @@ class Trainer:
                     self._save_checkpoint(config.MODEL_PATH)
     
                 pbar.update(1)
-                ray.shutdown()  # Завершаем Ray после каждого эпизода
-                ray.init(num_gpus=1, ignore_reinit_error=True)  # Перезапускаем Ray для следующего эпизода
+                torch.cuda.empty_cache()  # Очистка GPU после каждого эпизода
+                logging.info(f"Episode {episode} completed, global_step={self.global_step}")
                 if self.interrupted:
                     break
     
             self._save_checkpoint(config.MODEL_PATH)
-            ray.shutdown()  # Завершаем Ray после обучения
+            ray.shutdown()  # Завершение Ray в конце
         except Exception as e:
             last_exp = experiences[-1] if 'experiences' in locals() and experiences else 'N/A'
             error_msg = f"Training crashed: {traceback.format_exc()}\nLast experiences: {last_exp}"
@@ -1078,7 +1079,7 @@ class Trainer:
             with open(os.path.join(config.LOG_DIR, 'crash_details.txt'), 'a') as f:
                 f.write(f"{time.ctime()}: {error_msg}\n")
             self._save_checkpoint(os.path.join(config.LOG_DIR, 'crash_recovery.pt'))
-            ray.shutdown()  # Завершаем Ray при сбое
+            ray.shutdown()
             sys.exit(1)
     
         pbar.close()
