@@ -430,9 +430,11 @@ class PokerAgent(policy.Policy):
         )
         self.cumulative_regrets = {}
         self.cumulative_strategies = {}
+        self.max_dict_size = 10000  # Ограничим словари до 10k записей
         self.strategy_pool = []
         self.best_winrate = -float('inf')
         self.global_step = 0
+        logging.info(f"PokerAgent инициализирован, state_size={processor.state_size}, num_actions={self.num_actions}")
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
@@ -466,16 +468,20 @@ class PokerAgent(policy.Policy):
         is_drawy = len(set([c // 13 for c in board_cards])) < 3 if board_cards else False
 
         if action == 0 and pot > 0:
-            return -0.1 * (1 + pot / config.BB) * (1.5 if is_drawy else 1.0)
+            reward = -0.1 * (1 + pot / config.BB) * (1.5 if is_drawy else 1.0)
         elif action > 1:
             if any(m['fold_to_3bet'] > 0.7 for m in opp_metrics) and stage_idx == 0:
-                return 0.3 * hand_strength
-            if any(m['street_aggression'][stage_idx] < 0.2 for m in opp_metrics):
-                return 0.2 + 0.1 * hand_strength * (1.2 if is_drawy else 1.0)
-            return 0.1 * hand_strength
+                reward = 0.3 * hand_strength
+            elif any(m['street_aggression'][stage_idx] < 0.2 for m in opp_metrics):
+                reward = 0.2 + 0.1 * hand_strength * (1.2 if is_drawy else 1.0)
+            else:
+                reward = 0.1 * hand_strength
         elif action == 1 and any(m['last_bet'] > pot * 0.5 for m in opp_metrics):
-            return 0.1 * hand_strength if random.random() < 0.5 else -0.1
-        return 0.0
+            reward = 0.1 * hand_strength if random.random() < 0.5 else -0.1
+        else:
+            reward = 0.0
+        logging.debug(f"Heuristic reward for action {action}: {reward}")
+        return reward
 
     def _dynamic_bet_size(self, state, stacks: List[float], bets: List[float], position: int, opponent_metrics: Dict[str, float], 
                          q_value: float, stage: List[int], last_opp_bet: float) -> float:
@@ -496,6 +502,7 @@ class PokerAgent(policy.Policy):
             base = max(base, min_bet * 1.5)
         if last_opp_bet > 0:
             base = max(base, last_opp_bet * 1.1)
+        logging.debug(f"Dynamic bet size: {base}, q_value={q_value}, stage_idx={stage_idx}")
         return base
 
     def action_probabilities(self, state, player_id: Optional[int] = None, opponent_stats: Optional[OpponentStats] = None) -> Dict[int, float]:
@@ -528,6 +535,11 @@ class PokerAgent(policy.Policy):
             strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
             strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
     
+        # Ограничение размера словарей
+        if len(self.cumulative_regrets) >= self.max_dict_size:
+            self.cumulative_regrets.pop(next(iter(self.cumulative_regrets)))
+            self.cumulative_strategies.pop(next(iter(self.cumulative_strategies)))
+        
         if info_state not in self.cumulative_regrets:
             self.cumulative_regrets[info_state] = np.zeros(self.num_actions)
             self.cumulative_strategies[info_state] = np.zeros(self.num_actions)
@@ -536,9 +548,13 @@ class PokerAgent(policy.Policy):
         total_regret = positive_regrets.sum()
         probs = positive_regrets / total_regret if total_regret > 0 else strategy[legal_actions] / strategy[legal_actions].sum()
         self.cumulative_strategies[info_state][legal_actions] += probs
+        
         if len(self.strategy_pool) < 5 and random.random() < 0.1:
             self.strategy_pool.append({'weights': copy.deepcopy(self.strategy_net.state_dict()), 'winrate': 0.0})
-        return {a: float(p) for a, p in zip(legal_actions, probs)}
+        
+        probs_dict = {a: float(p) for a, p in zip(legal_actions, probs)}
+        logging.debug(f"Action probabilities for player {player_id}: {probs_dict}")
+        return probs_dict
 
     def step(self, state, player_id: int, bets: List[float], stacks: List[float], stage: List[int], opponent_stats: OpponentStats) -> int:
         epsilon = max(0.1, 1.0 - self.global_step / 100000)
@@ -555,6 +571,7 @@ class PokerAgent(policy.Policy):
                 action = 3
             elif 2 in state.legal_actions(player_id):
                 action = 2
+        logging.debug(f"Step for player {player_id}: action={action}, epsilon={epsilon}")
         return action
 
     def update_strategy_pool(self, winrate: float):
@@ -566,7 +583,7 @@ class PokerAgent(policy.Policy):
             self.best_winrate = max(self.best_winrate, winrate)
         if len(self.strategy_pool) > 10:
             self.strategy_pool = sorted(self.strategy_pool, key=lambda x: x['winrate'], reverse=True)[:10]
-
+        logging.debug(f"Strategy pool updated, size={len(self.strategy_pool)}, best_winrate={self.best_winrate}")
 # ===== СБОР ДАННЫХ =====
 @ray.remote(num_cpus=1, num_gpus=0.5)
 def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps: int, worker_id: int, queue=None):
