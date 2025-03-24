@@ -1,4 +1,3 @@
-#19
 import os
 import time
 import logging
@@ -15,7 +14,7 @@ from tqdm.auto import tqdm
 import joblib
 import argparse
 from sklearn.cluster import KMeans
-from collections import deque
+from collections import deque, defaultdict
 from typing import List, Tuple, Dict, Optional
 from open_spiel.python import policy
 
@@ -56,6 +55,8 @@ class Config:
         self.CHECKPOINT_INTERVAL = 30
         self.NUM_BUCKETS = 50
         self.BB = 2
+        self.MAX_STRATEGY_POOL = 10
+        self.MAX_DICT_SIZE = 10000
         self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2 3 4 5 6,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
 
 config = Config()
@@ -356,6 +357,9 @@ class PokerAgent(policy.Policy):
             lr=config.LEARNING_RATE
         )
         self.global_step = 0
+        self.cumulative_regrets = defaultdict(lambda: np.zeros(self.num_actions, dtype=np.float32))
+        self.cumulative_strategies = defaultdict(lambda: np.zeros(self.num_actions, dtype=np.float32))
+        self.strategy_pool = []  # Список словарей {state_key: action_probs}
         logging.info(f"PokerAgent инициализирован, state_size={processor.state_size}, num_actions={self.num_actions}")
 
     def action_probabilities(self, state, player_id: Optional[int] = None, opponent_stats: Optional[OpponentStats] = None) -> Dict[int, float]:
@@ -377,21 +381,52 @@ class PokerAgent(policy.Policy):
             stage[3] = 1
         state_tensor = torch.tensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats), 
                                   dtype=torch.float32, device=device)
+        state_key = state.information_state_string(player_id)
+        
         with torch.no_grad():
             self.strategy_net.eval()
             strategy_logits = self.strategy_net(state_tensor)[0]
             self.strategy_net.train()
+            q_values = self.regret_net(state_tensor)[0]
             legal_mask = torch.zeros(self.num_actions, device=device)
             legal_mask[legal_actions] = 1
             strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
             strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
-        probs_dict = {a: float(strategy[a]) for a in legal_actions}
-        return probs_dict
+            regrets = torch.relu(q_values - q_values.max()).cpu().numpy()
+        
+        self.cumulative_regrets[state_key] += regrets
+        self.cumulative_strategies[state_key] += strategy
+        if len(self.cumulative_regrets) > config.MAX_DICT_SIZE:
+            self.cumulative_regrets.clear()
+            self.cumulative_strategies.clear()
+        
+        positive_regrets = np.maximum(self.cumulative_regrets[state_key], 0)
+        regret_sum = positive_regrets.sum()
+        if regret_sum > 0:
+            probs = positive_regrets / regret_sum
+        else:
+            probs = np.ones(self.num_actions) / len(legal_actions) if legal_actions else np.array([1.0])
+        probs_dict = {a: float(probs[a]) if a in legal_actions else 0.0 for a in range(self.num_actions)}
+        return {k: v for k, v in probs_dict.items() if k in legal_actions}
 
     def step(self, state, player_id, opponent_stats: OpponentStats):
         probs = self.action_probabilities(state, player_id, opponent_stats)
         action = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
         return action
+
+    def update_strategy_pool(self):
+        strategy_dict = {}
+        for state_key, cum_strategy in self.cumulative_strategies.items():
+            total = cum_strategy.sum()
+            if total > 0:
+                strategy_dict[state_key] = cum_strategy / total
+            else:
+                strategy_dict[state_key] = np.ones(self.num_actions) / self.num_actions
+        if len(self.strategy_pool) >= config.MAX_STRATEGY_POOL:
+            self.strategy_pool.pop(0)
+        self.strategy_pool.append(strategy_dict)
+        self.cumulative_strategies.clear()
+        logging.info(f"Strategy pool updated, size: {len(self.strategy_pool)}")
 
 # Сбор опыта
 @ray.remote(num_cpus=1, num_gpus=0.5)
@@ -502,6 +537,8 @@ class Trainer:
                     self.global_step += 1
                     logging.info(f"Step {self.global_step} | Loss: {loss.item():.4f}")
                     self.beta = min(1.0, self.beta + 0.001)
+                
+                self.agent.update_strategy_pool()
             
             pbar.update(1)
         pbar.close()
