@@ -330,7 +330,7 @@ class StateProcessor:
         logging.info(f"Бакеты вычислены и сохранены в {config.KMEANS_PATH}")
         return kmeans
 
-    def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
+        def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
                 opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
         batch_size = len(states)
         logging.debug(f"Processing batch_size={batch_size}, player_ids={player_ids}")
@@ -356,7 +356,14 @@ class StateProcessor:
                 private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
-        card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy().astype(np.float32)
+        # Явно задаём float32 для тензоров в CardEmbedding
+        card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
+        if card_embs.dtype != np.float32:
+            logging.debug(f"Converting card_embs from {card_embs.dtype} to float32")
+            card_embs = card_embs.astype(np.float32)
+        
+        # Проверка перед predict
+        logging.debug(f"card_embs shape={card_embs.shape}, dtype={card_embs.dtype}")
         bucket_idxs = self.buckets.predict(card_embs)
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
