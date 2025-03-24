@@ -345,7 +345,7 @@ class StateProcessor:
             return [r + suit_mapping[s] * 13 for r, s in zip(original_ranks, original_suits)]
 
     def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
-                opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
+            opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
         batch_size = len(states)
         logging.debug(f"Processing batch_size={batch_size}, player_ids={player_ids}")
         
@@ -354,8 +354,8 @@ class StateProcessor:
                       for s, pid, b, stk in zip(states, player_ids, bets, stacks)]
         cached = [self.cache.__get__(key, None) for key in state_keys]
         if all(c is not None for c in cached):
-            return np.array(cached)
-    
+            return np.array(cached, dtype=np.float32)
+        
         # Преобразуем состояния в тензоры
         info_states = [s.information_state_tensor(pid) for s, pid in zip(states, player_ids)]
         cards_batch = [[int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in s.player_cards(pid)] 
@@ -365,26 +365,25 @@ class StateProcessor:
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
         logging.debug(f"bucket_one_hot shape={bucket_one_hot.shape}, dtype={bucket_one_hot.dtype}")
-    
+        
         # Нормализуем ставки и стеки
         bets_norm = np.array(bets, dtype=np.float32) / (np.array(stacks, dtype=np.float32) + 1e-8)
         stacks_norm = np.array(stacks, dtype=np.float32) / 1000.0
-        pots = [sum(b) for b in bets]
-        sprs = [stk[pid] / pot if pot > 0 else 10.0 for stk, pid, pot in zip(stacks, player_ids, pots)]
-        positions = [(pid - s.current_player()) % config.NUM_PLAYERS / config.NUM_PLAYERS 
-                     for s, pid in zip(states, player_ids)]
+        pots = np.array([sum(b) for b in bets], dtype=np.float32)
+        sprs = np.array([stk[pid] / pot if pot > 0 else 10.0 for stk, pid, pot in zip(stacks, player_ids, pots)], dtype=np.float32)
+        positions = np.array([(pid - s.current_player()) % config.NUM_PLAYERS / config.NUM_PLAYERS 
+                             for s, pid in zip(states, player_ids)], dtype=np.float32)
         logging.debug(f"bets_norm shape={bets_norm.shape}, dtype={bets_norm.dtype}")
         logging.debug(f"stacks_norm shape={stacks_norm.shape}, dtype={stacks_norm.dtype}")
-    
+        
         # История действий
-        action_history = [([0] * config.NUM_PLAYERS if not hasattr(s, 'action_history') else 
-                          [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) for s in states]
-        action_history = np.array(action_history, dtype=np.float32)
+        action_history = np.array([([0] * config.NUM_PLAYERS if not hasattr(s, 'action_history') else 
+                                   [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) for s in states], dtype=np.float32)
         logging.debug(f"action_history shape={action_history.shape}, dtype={action_history.dtype}")
-    
+        
         # Обработка метрик оппонентов
         opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
-                           if opponent_stats else [] for pid in player_ids]
+                            if opponent_stats else [] for pid in player_ids]
         opp_features = []
         for metrics in opponent_metrics:
             if metrics:
@@ -402,15 +401,17 @@ class StateProcessor:
             opp_features.append([agg_vpip, agg_pfr, agg_fold_to_cbet, agg_fold_to_3bet, agg_street_agg])
         opp_features = np.array(opp_features, dtype=np.float32)
         logging.debug(f"opp_features shape={opp_features.shape}, dtype={opp_features.dtype}")
-    
+        
         # Дополнительные признаки
-        table_aggs = [np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics]
-        last_bets = [max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
-                     for metrics, pot in zip(opponent_metrics, pots)]
-        all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
-                        for bet, stk, pid in zip(bets, stacks, player_ids)]
-        logging.debug(f"table_aggs={table_aggs}, last_bets={last_bets}, all_in_flags={all_in_flags}")
-    
+        table_aggs = np.array([np.mean([m['af'] for m in metrics]) if metrics else 0.5 for metrics in opponent_metrics], dtype=np.float32)
+        last_bets = np.array([max([m['last_bet'] for m in metrics]) / pot if pot > 0 and metrics else 0.0 
+                             for metrics, pot in zip(opponent_metrics, pots)], dtype=np.float32)
+        all_in_flags = np.array([1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
+                                for bet, stk, pid in zip(bets, stacks, player_ids)], dtype=np.float32)
+        logging.debug(f"table_aggs shape={table_aggs.shape}, dtype={table_aggs.dtype}")
+        logging.debug(f"last_bets shape={last_bets.shape}, dtype={last_bets.dtype}")
+        logging.debug(f"all_in_flags shape={all_in_flags.shape}, dtype={all_in_flags.dtype}")
+        
         # Собираем все в один массив
         features_list = [
             bucket_one_hot,
@@ -421,17 +422,17 @@ class StateProcessor:
             np.array([sprs, table_aggs, positions, last_bets, all_in_flags], dtype=np.float32).T,
             opp_features
         ]
-        processed = np.concatenate(features_list, axis=1)
+        processed = np.concatenate(features_list, axis=1).astype(np.float32)
         logging.debug(f"processed shape={processed.shape}, dtype={processed.dtype}")
-    
+        
         # Проверяем на NaN/Inf и тип данных
         if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
             logging.error(f"NaN/Inf in processed: {processed}")
             raise ValueError("Invalid state processing detected")
-        if processed.dtype == np.object_:
-            logging.error(f"Processed array has dtype object: {processed}")
-            raise ValueError("Processed array contains non-numeric data")
-    
+        if processed.dtype != np.float32:
+            logging.error(f"Processed array has incorrect dtype: {processed.dtype}, expected np.float32")
+            raise ValueError(f"Processed array dtype {processed.dtype} is not np.float32")
+        
         # Сохраняем в кэш и возвращаем
         for key, proc in zip(state_keys, processed):
             self.cache.__set__(key, proc)
