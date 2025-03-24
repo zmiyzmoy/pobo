@@ -382,16 +382,18 @@ class StateProcessor:
         all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
                         for bet, stk, pid in zip(bets, stacks, player_ids)]
 
-        # Исправление: Преобразуем opponent_metrics в числовой массив, убираем словари и явно приводим к float
+        # Формируем opp_features только из числовых данных
         opp_features = []
         for metrics in opponent_metrics:
             if metrics:
+                # Используем только числовые метрики
                 agg_vpip = float(np.mean([float(m['vpip']) for m in metrics]))
                 agg_pfr = float(np.mean([float(m['pfr']) for m in metrics]))
                 agg_fold_to_cbet = float(np.mean([float(m['fold_to_cbet']) for m in metrics]))
                 agg_fold_to_3bet = float(np.mean([float(m['fold_to_3bet']) for m in metrics]))
                 agg_street_agg = float(np.mean([float(np.mean(m['street_aggression'])) for m in metrics]))
             else:
+                # Значения по умолчанию, если данных нет
                 agg_vpip = 0.5
                 agg_pfr = 0.5
                 agg_fold_to_cbet = 0.5
@@ -400,9 +402,10 @@ class StateProcessor:
             opp_features.append([agg_vpip, agg_pfr, agg_fold_to_cbet, agg_fold_to_3bet, agg_street_agg])
         opp_features = np.array(opp_features, dtype=np.float32)
 
-        # Исправление: Проверка на нечисловые значения
+        # Проверка на нечисловые значения
         assert all(isinstance(x, (float, np.floating)) for feat in opp_features for x in feat), "Non-numeric values in opp_features"
 
+        # Конкатенация всех числовых массивов
         processed = np.concatenate([
             bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages),
             np.array([sprs, table_aggs, positions, last_bets, all_in_flags]).T,
@@ -423,7 +426,6 @@ class StateProcessor:
         for key, proc in zip(state_keys, processed):
             self.cache.__set__(key, proc)
         return processed.astype(np.float32)
-
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor: StateProcessor):
@@ -679,9 +681,9 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(pyspiel.Policy):
     def __init__(self, game):
-        # Исправление: Передаём game и player_ids в базовый конструктор
-        super().__init__(game, list(range(game.num_players())))
+        super().__init__()  # Вызываем базовый конструктор без аргументов
         self.game = game
+        self.player_ids = list(range(game.num_players()))  # Сохраняем список игроков, если нужно
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
@@ -727,7 +729,6 @@ class TightAggressiveAgent(pyspiel.Policy):
             probs[0] = 0.7 if pot > 0 else 0.3
             probs[1] = 1.0 - probs[0]
         return probs
-
 class LooseAggressiveAgent(policy.Policy):
     def __init__(self, game):
         super().__init__(game)
