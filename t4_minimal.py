@@ -1,4 +1,4 @@
-#^
+#^r
 import os
 import time
 import logging
@@ -245,6 +245,7 @@ class OpponentStats:
         }
 
 # Обработка состояний
+# Обработка состояний
 class StateProcessor:
     def __init__(self):
         self.card_embedding = CardEmbedding()
@@ -266,6 +267,8 @@ class StateProcessor:
                     hand = [r1 + suited * 13, r2 + suited * 13]
                     embedding = self.card_embedding(hand).cpu().detach().numpy().astype(np.float32)
                     all_hands.append(embedding)
+        # Явное приведение всего списка к float32
+        all_hands = np.array(all_hands, dtype=np.float32)
         kmeans = KMeans(n_clusters=config.NUM_BUCKETS, random_state=42).fit(all_hands)
         joblib.dump(kmeans, config.KMEANS_PATH)
         logging.info(f"Бакеты вычислены и сохранены в {config.KMEANS_PATH}")
@@ -300,6 +303,8 @@ class StateProcessor:
         
         card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).to(dtype=torch.float32)
         card_embs = card_embs.cpu().detach().numpy().astype(np.float32)
+        # Диагностика
+        logging.debug(f"card_embs shape: {card_embs.shape}, dtype: {card_embs.dtype}, sample: {card_embs[0][:5]}")
         if card_embs.dtype != np.float32:
             logging.error(f"card_embs имеет тип {card_embs.dtype}, ожидается float32")
             card_embs = card_embs.astype(np.float32)
