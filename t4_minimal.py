@@ -1,4 +1,4 @@
-#^rem
+#^rems
 import os
 import time
 import logging
@@ -45,7 +45,7 @@ class Config:
         self.BATCH_SIZE = 64
         self.GAMMA = 0.96
         self.BUFFER_CAPACITY = 2000
-        self.NUM_WORKERS = 1
+        self.NUM_WORKERS = 4  # Увеличиваем до 4 воркеров
         self.STEPS_PER_WORKER = 500
         self.SELFPLAY_UPDATE_FREQ = 50
         self.LOG_FREQ = 10
@@ -519,11 +519,19 @@ class Trainer:
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
         for episode in range(config.NUM_EPISODES):
             logging.info(f"Starting episode {episode}")
-            futures = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, 0)]
-            experiences = ray.get(futures)[0]
+            # Запускаем сбор опыта для всех воркеров
+            futures = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i)
+                       for i in range(config.NUM_WORKERS)]
+            all_experiences = ray.get(futures)
+            
+            # Объединяем опыт от всех воркеров
+            experiences = []
+            for worker_experiences in all_experiences:
+                experiences.extend(worker_experiences)
             
             if experiences:
                 self.buffer.add_batch(experiences)
+                logging.info(f"Collected {len(experiences)} total experiences from {config.NUM_WORKERS} workers")
                 
                 if len(self.buffer) >= config.BATCH_SIZE:
                     batch, indices, weights = self.buffer.sample(config.BATCH_SIZE, self.beta)
@@ -567,11 +575,10 @@ class Trainer:
             
             pbar.update(1)
         pbar.close()
-
 # Запуск
 if __name__ == "__main__":
     mp.set_start_method('spawn')
-    ray.init(num_gpus=1, num_cpus=4, ignore_reinit_error=True)
+    ray.init(num_gpus=1, num_cpus=config.NUM_WORKERS, ignore_reinit_error=True)  # Устанавливаем num_cpus равным NUM_WORKERS
     game = pyspiel.load_game(config.GAME_NAME)
     processor = StateProcessor()
     agent = PokerAgent(game, processor)
