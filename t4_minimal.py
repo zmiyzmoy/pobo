@@ -1,4 +1,4 @@
-#^re
+#^rem
 import os
 import time
 import logging
@@ -359,7 +359,6 @@ class StateProcessor:
         return processed
 
 # Агент с поддержкой PSRO
-# Агент с поддержкой PSRO
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor):
         player_ids = list(range(game.num_players()))
@@ -402,11 +401,13 @@ class PokerAgent(policy.Policy):
         
         with torch.no_grad():
             self.strategy_net.eval()
-            self.regret_net.eval()  # Переводим regret_net в режим eval
+            self.regret_net.eval()
+            logging.debug(f"RegretNet in eval mode: {not self.regret_net.training}")
             strategy_logits = self.strategy_net(state_tensor)[0]
             q_values = self.regret_net(state_tensor)[0]
             self.strategy_net.train()
-            self.regret_net.train()  # Возвращаем regret_net в режим train
+            self.regret_net.train()
+            logging.debug(f"RegretNet back in train mode: {self.regret_net.training}")
             legal_mask = torch.zeros(self.num_actions, device=device)
             legal_mask[legal_actions] = 1
             strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
