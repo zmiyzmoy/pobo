@@ -1,4 +1,3 @@
-#3
 import os
 import time
 import logging
@@ -58,6 +57,7 @@ class Config:
         self.BB = 2
         self.MAX_STRATEGY_POOL = 10
         self.MAX_DICT_SIZE = 10000
+        self.REWARD_NORMALIZATION = 'stack'  # или 'bb' для нормализации по большому блайнду
         self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2 3 4 5 6,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
 
 config = Config()
@@ -292,7 +292,6 @@ class StateProcessor:
                 private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
-        # Явное приведение к float32 на всех этапах
         card_embs = torch.stack([self.card_embedding(cards).to(dtype=torch.float32) for cards in cards_batch])
         card_embs = card_embs.cpu().detach().numpy().astype(np.float32)
         bucket_idxs = self.buckets.predict(card_embs)
@@ -344,6 +343,7 @@ class StateProcessor:
             self.cache[key] = proc
         
         return processed
+
 # Агент с поддержкой PSRO
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor):
@@ -361,7 +361,7 @@ class PokerAgent(policy.Policy):
         self.global_step = 0
         self.cumulative_regrets = defaultdict(lambda: np.zeros(self.num_actions, dtype=np.float32))
         self.cumulative_strategies = defaultdict(lambda: np.zeros(self.num_actions, dtype=np.float32))
-        self.strategy_pool = []  # Список словарей {state_key: action_probs}
+        self.strategy_pool = []
         logging.info(f"PokerAgent инициализирован, state_size={processor.state_size}, num_actions={self.num_actions}")
 
     def action_probabilities(self, state, player_id: Optional[int] = None, opponent_stats: Optional[OpponentStats] = None) -> Dict[int, float]:
@@ -468,7 +468,14 @@ def collect_experience(game, agent, processor, steps, worker_id):
             action = agent.step(env, player_id, opponent_stats)
             next_state = env.clone()
             next_state.apply_action(action)
-            reward = next_state.returns()[player_id] if next_state.is_terminal() else 0
+            raw_reward = next_state.returns()[player_id] if next_state.is_terminal() else 0
+            # Нормализация награды
+            if config.REWARD_NORMALIZATION == 'stack':
+                reward = raw_reward / max(stacks[player_id], 1e-8)
+            elif config.REWARD_NORMALIZATION == 'bb':
+                reward = raw_reward / config.BB
+            else:
+                reward = raw_reward
             is_blind = player_id in [0, 1] and sum(bets) <= config.BB * 2
             position = (player_id - env.current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
             bet_size = bets[player_id] if action > 1 else 0
