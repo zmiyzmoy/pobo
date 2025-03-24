@@ -306,7 +306,7 @@ class StateProcessor:
         self.card_embedding = CardEmbedding().to(device)
         self.buckets = self._load_or_precompute_buckets()
         self.state_size = config.NUM_BUCKETS + config.NUM_PLAYERS * 3 + 4 + 5
-        self.cache = lru_cache(maxsize=10000)
+        self.cache = {}  # Явный словарь вместо lru_cache
         logging.info("StateProcessor инициализирован")
 
     def _load_or_precompute_buckets(self):
@@ -352,7 +352,9 @@ class StateProcessor:
         # Формируем ключи для кэша
         state_keys = [f"{s.information_state_string(pid)}_{pid}_{tuple(b)}_{tuple(stk)}" 
                       for s, pid, b, stk in zip(states, player_ids, bets, stacks)]
-        cached = [self.cache.__get__(key, None) for key in state_keys]
+        
+        # Проверяем кэш
+        cached = [self.cache.get(key) for key in state_keys]
         if all(c is not None for c in cached):
             return np.array(cached, dtype=np.float32)
         
@@ -435,9 +437,8 @@ class StateProcessor:
         
         # Сохраняем в кэш и возвращаем
         for key, proc in zip(state_keys, processed):
-            self.cache.__set__(key, proc)
+            self.cache[key] = proc  # Сохраняем результат в словаре
         return processed
-
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor: StateProcessor):
