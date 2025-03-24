@@ -1,10 +1,11 @@
-# Импорт всех необходимых библиотек2
+# Импорт всех необходимых библиотек3
 import os
 import time
 import logging
 import sys
 import signal
 import random
+import gc
 from collections import deque
 from typing import List, Tuple, Dict, Optional
 import numpy as np
@@ -42,9 +43,9 @@ class Config:
         self.NUM_EPISODES = 1  # Для теста
         self.BATCH_SIZE = 64
         self.GAMMA = 0.96
-        self.BUFFER_CAPACITY = 2000  # Уменьшаем до 2000, достаточно для обучения
-        self.NUM_WORKERS = 1  # Оставляем Ray с 1 воркером
-        self.STEPS_PER_WORKER = 500  # Уменьшаем до 500
+        self.BUFFER_CAPACITY = 2000
+        self.NUM_WORKERS = 1
+        self.STEPS_PER_WORKER = 500
         self.SELFPLAY_UPDATE_FREQ = 50
         self.LOG_FREQ = 10
         self.TEST_INTERVAL = 50
@@ -61,7 +62,7 @@ config = Config()
 os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
 os.makedirs(config.LOG_DIR, exist_ok=True)
 logging.basicConfig(
-    level=logging.INFO,  # Меняем на INFO для меньшего объема логов, но оставляем DEBUG внутри process
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(os.path.join(config.LOG_DIR, 'training.log')),
@@ -216,13 +217,13 @@ class PrioritizedReplayBuffer:
 class CardEmbedding(nn.Module):
     def __init__(self):
         super().__init__()
-        self.rank_embed = nn.Embedding(13, 8)
-        self.suit_embed = nn.Embedding(4, 4)
+        self.rank_embed = nn.Embedding(13, 8).to(device)
+        self.suit_embed = nn.Embedding(4, 4).to(device)
         logging.info("CardEmbedding инициализирован")
 
     def forward(self, cards: List[int]) -> torch.Tensor:
-        ranks = torch.tensor([c % 13 for c in cards], dtype=torch.long).to(device)
-        suits = torch.tensor([c // 13 for c in cards], dtype=torch.long).to(device)
+        ranks = torch.tensor([c % 13 for c in cards], dtype=torch.long, device=device)
+        suits = torch.tensor([c // 13 for c in cards], dtype=torch.long, device=device)
         return torch.cat([self.rank_embed(ranks).mean(dim=0), self.suit_embed(suits).mean(dim=0)])
 
 # ===== СТАТИСТИКА ОППОНЕНТОВ =====
@@ -301,20 +302,33 @@ class OpponentStats:
 class StateProcessor:
     def __init__(self):
         self.card_embedding = CardEmbedding()
-        self.buckets = joblib.load(config.KMEANS_PATH)
+        self.buckets = self._load_or_precompute_buckets()
         self.cache = {}
         self.max_cache_size = 1000
-        # Рассчитываем размер состояния
         self.state_size = (
-            config.NUM_BUCKETS +       # bucket_one_hot
-            config.NUM_PLAYERS +       # bets_norm
-            config.NUM_PLAYERS +       # stacks_norm
-            config.NUM_PLAYERS +       # action_history
-            4 +                        # stages
-            5 +                        # sprs, table_aggs, positions, last_bets, all_in_flags
-            5                          # opp_features
-        )  # Итого: 82 при текущих настройках
+            config.NUM_BUCKETS + config.NUM_PLAYERS * 3 + 4 + 5
+        )
         logging.info(f"StateProcessor инициализирован, state_size={self.state_size}")
+
+    def _load_or_precompute_buckets(self):
+        if os.path.exists(config.KMEANS_PATH):
+            try:
+                buckets = joblib.load(config.KMEANS_PATH)
+                logging.info(f"Загружены бакеты из {config.KMEANS_PATH}")
+                return buckets
+            except Exception as e:
+                logging.warning(f"Не удалось загрузить KMeans: {e}, пересчитываем")
+        all_hands = []
+        for r1 in range(13):
+            for r2 in range(r1, 13):
+                for suited in [0, 1]:
+                    hand = [r1 + s1 * 13 for s1 in range(4)] + [r2 + s2 * 13 for s2 in range(4)]
+                    embedding = self.card_embedding(hand[:2]).cpu().detach().numpy()
+                    all_hands.append(embedding)
+        kmeans = KMeans(n_clusters=config.NUM_BUCKETS, random_state=42).fit(all_hands)
+        joblib.dump(kmeans, config.KMEANS_PATH)
+        logging.info(f"Бакеты вычислены и сохранены в {config.KMEANS_PATH}")
+        return kmeans
 
     def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
                 opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
@@ -343,13 +357,6 @@ class StateProcessor:
             cards_batch.append(private_cards)
         
         card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy().astype(np.float32)
-        logging.debug(f"card_embs dtype after creation: {card_embs.dtype}, shape: {card_embs.shape}")
-        
-        if card_embs.dtype != np.float32:
-            logging.warning(f"card_embs dtype is {card_embs.dtype}, forcing to float32")
-            card_embs = card_embs.astype(np.float32)
-        logging.debug(f"card_embs dtype before predict: {card_embs.dtype}, shape: {card_embs.shape}")
-        
         bucket_idxs = self.buckets.predict(card_embs)
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
@@ -389,16 +396,10 @@ class StateProcessor:
         all_in_flags = np.array([1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
                                 for bet, stk, pid in zip(bets, stacks, player_ids)], dtype=np.float32)
         
-        features_list = [
-            bucket_one_hot,
-            bets_norm,
-            stacks_norm,
-            action_history,
-            np.array(stages, dtype=np.float32),
-            np.array([sprs, table_aggs, positions, last_bets, all_in_flags], dtype=np.float32).T,
-            opp_features
-        ]
-        processed = np.concatenate(features_list, axis=1).astype(np.float32)
+        processed = np.concatenate([
+            bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages, dtype=np.float32),
+            np.array([sprs, table_aggs, positions, last_bets, all_in_flags], dtype=np.float32).T, opp_features
+        ], axis=1).astype(np.float32)
         
         if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
             logging.error(f"NaN/Inf in processed: {processed}")
@@ -409,9 +410,7 @@ class StateProcessor:
         for key, proc in zip(state_keys, processed):
             self.cache[key] = proc
         
-        del card_embs, bucket_one_hot, bets_norm, stacks_norm, pots, sprs, positions, action_history, opp_features, table_aggs, last_bets, all_in_flags, features_list
         gc.collect()
-        
         return processed
 
 # ===== АГЕНТ =====
@@ -430,7 +429,7 @@ class PokerAgent(policy.Policy):
         )
         self.cumulative_regrets = {}
         self.cumulative_strategies = {}
-        self.max_dict_size = 10000  # Ограничим словари до 10k записей
+        self.max_dict_size = 10000
         self.strategy_pool = []
         self.best_winrate = -float('inf')
         self.global_step = 0
@@ -535,7 +534,6 @@ class PokerAgent(policy.Policy):
             strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
             strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
     
-        # Ограничение размера словарей
         if len(self.cumulative_regrets) >= self.max_dict_size:
             self.cumulative_regrets.pop(next(iter(self.cumulative_regrets)))
             self.cumulative_strategies.pop(next(iter(self.cumulative_strategies)))
@@ -584,6 +582,7 @@ class PokerAgent(policy.Policy):
         if len(self.strategy_pool) > 10:
             self.strategy_pool = sorted(self.strategy_pool, key=lambda x: x['winrate'], reverse=True)[:10]
         logging.debug(f"Strategy pool updated, size={len(self.strategy_pool)}, best_winrate={self.best_winrate}")
+
 # ===== СБОР ДАННЫХ =====
 @ray.remote(num_cpus=1, num_gpus=0.5)
 def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps: int, worker_id: int, queue=None):
@@ -596,7 +595,6 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             logging.error(f"Worker {worker_id}: Initial state is terminal, returns={env.returns()}")
             return ([], OpponentStats(), 0)
 
-        # Используем одну копию агента для всех оппонентов, чтобы сэкономить память
         agents = [agent] + [copy.deepcopy(agent) for _ in range(config.NUM_PLAYERS - 1)]
         experiences = []
         opponent_stats = OpponentStats()
@@ -625,7 +623,7 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             stacks = env.stacks() if hasattr(env, 'stacks') else [1000] * config.NUM_PLAYERS
             
             info_tensor = env.information_state_tensor(player_id)
-            board_cards = [int(i) for i, c in enumerate(info_tensor[52:104]) if c > 0]
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
             num_board_cards = len(board_cards)
             stage = [0] * 4
             if num_board_cards == 0:
@@ -645,7 +643,6 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
             experiences.append((env.clone(), action, reward, next_state.clone(), next_state.is_terminal(), player_id, bets[:], stacks[:], stage[:]))
             env = next_state
 
-            # Очистка каждые 100 шагов
             if step % 100 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -667,13 +664,11 @@ class TightAggressiveAgent(pyspiel.Policy):
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
-        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]
+        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0][:2]
         if len(cards) != 2:
             return 0.1
         ranks = sorted([c % 13 for c in cards], reverse=True)
         is_suited = len(set([c // 13 for c in cards])) == 1
-        if len(ranks) < 2:
-            return 0.1
         if ranks[0] >= 10 or (ranks[0] == ranks[1]):
             return 0.7 if is_suited else 0.6
         return 0.2 if is_suited else 0.1
@@ -684,7 +679,7 @@ class TightAggressiveAgent(pyspiel.Policy):
             return {0: 1.0}
         strength = self._hand_strength(state, player_id)
         info_tensor = state.information_state_tensor(player_id)
-        board_cards = [int(c) for i, c in enumerate(info_tensor[52:104]) if c > 0]
+        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
         num_board_cards = len(board_cards)
         stage = 0
         if num_board_cards == 0:
@@ -719,13 +714,11 @@ class LooseAggressiveAgent(policy.Policy):
 
     def _hand_strength(self, state, player_id: int) -> float:
         info = state.information_state_tensor(player_id)
-        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]
+        cards = [int(i) for i, c in enumerate(info[:52]) if c > 0][:2]
         if len(cards) != 2:
             return 0.1
         ranks = sorted([c % 13 for c in cards], reverse=True)
         is_suited = len(set([c // 13 for c in cards])) == 1
-        if len(ranks) < 2:
-            return 0.1
         return 0.5 if is_suited or ranks[0] >= 8 else 0.3
 
     def action_probabilities(self, state, player_id: Optional[int] = None) -> Dict[int, float]:
@@ -748,154 +741,149 @@ class LooseAggressiveAgent(policy.Policy):
             probs[1] = 0.5
         return probs
 
-    def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games: int = 50, compute_exploitability: bool = False) -> Tuple[float, float]:
-        from open_spiel.python.algorithms import exploitability, cfr
-        num_games = 200 if config.NUM_EPISODES > 10 else 50
-        total_reward_vs_pool = 0
-        total_reward_vs_tag = 0
-        total_reward_vs_lag = 0
-        total_reward_vs_random = 0
-        tag_agent = TightAggressiveAgent(game)
-        lag_agent = LooseAggressiveAgent(game)
-        cfr_agent = cfr.CFRSolver(game)
-        winrates = {'Pool': [], 'TAG': [], 'LAG': [], 'Random': [], 'CFR': []}
-    
-        for _ in range(num_games):
-            state = game.new_initial_state()
-            opponents = [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]
-            for opp in opponents:
-                if agent.strategy_pool:
-                    opp.strategy_net.load_state_dict(random.choice([s['weights'] for s in agent.strategy_pool]))
-            while not state.is_terminal():
-                player_id = state.current_player()
-                bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
-                stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-                info_tensor = state.information_state_tensor(player_id)
-                board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-                num_board_cards = len(board_cards)
-                stage = [0] * 4
-                if num_board_cards == 0:
-                    stage[0] = 1
-                elif num_board_cards == 3:
-                    stage[1] = 1
-                elif num_board_cards == 4:
-                    stage[2] = 1
-                elif num_board_cards == 5:
-                    stage[3] = 1
-                opponent_stats = OpponentStats()
-                action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else opponents[player_id - 1].step(state, player_id, bets, stacks, stage, opponent_stats)
-                state.apply_action(action)
-            total_reward_vs_pool += state.returns()[0]
-        winrates['Pool'].append(total_reward_vs_pool / num_games)
-    
-        for _ in range(num_games):
-            state = game.new_initial_state()
-            tag_opponents = [tag_agent] * (config.NUM_PLAYERS - 1)
-            while not state.is_terminal():
-                player_id = state.current_player()
-                bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
-                stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-                info_tensor = state.information_state_tensor(player_id)
-                board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-                num_board_cards = len(board_cards)
-                stage = [0] * 4
-                if num_board_cards == 0:
-                    stage[0] = 1
-                elif num_board_cards == 3:
-                    stage[1] = 1
-                elif num_board_cards == 4:
-                    stage[2] = 1
-                elif num_board_cards == 5:
-                    stage[3] = 1
-                opponent_stats = OpponentStats()
-                action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(tag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: tag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
-                state.apply_action(action)
-            total_reward_vs_tag += state.returns()[0]
-        winrates['TAG'].append(total_reward_vs_tag / num_games)
-    
-        for _ in range(num_games):
-            state = game.new_initial_state()
-            lag_opponents = [lag_agent] * (config.NUM_PLAYERS - 1)
-            while not state.is_terminal():
-                player_id = state.current_player()
-                bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
-                stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-                info_tensor = state.information_state_tensor(player_id)
-                board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-                num_board_cards = len(board_cards)
-                stage = [0] * 4
-                if num_board_cards == 0:
-                    stage[0] = 1
-                elif num_board_cards == 3:
-                    stage[1] = 1
-                elif num_board_cards == 4:
-                    stage[2] = 1
-                elif num_board_cards == 5:
-                    stage[3] = 1
-                opponent_stats = OpponentStats()
-                action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(lag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: lag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
-                state.apply_action(action)
-            total_reward_vs_lag += state.returns()[0]
-        winrates['LAG'].append(total_reward_vs_lag / num_games)
-    
-        for _ in range(num_games):
-            state = game.new_initial_state()
-            while not state.is_terminal():
-                player_id = state.current_player()
-                bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
-                stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-                info_tensor = state.information_state_tensor(player_id)
-                board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-                num_board_cards = len(board_cards)
-                stage = [0] * 4
-                if num_board_cards == 0:
-                    stage[0] = 1
-                elif num_board_cards == 3:
-                    stage[1] = 1
-                elif num_board_cards == 4:
-                    stage[2] = 1
-                elif num_board_cards == 5:
-                    stage[3] = 1
-                opponent_stats = OpponentStats()
-                action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else random.choice(state.legal_actions(player_id))
-                state.apply_action(action)
-            total_reward_vs_random += state.returns()[0]
-        winrates['Random'].append(total_reward_vs_random / num_games)
-    
-        total_reward_vs_cfr = 0
-        for _ in range(num_games // 2):
-            state = game.new_initial_state()
-            while not state.is_terminal():
-                player_id = state.current_player()
-                bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
-                stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-                info_tensor = state.information_state_tensor(player_id)
-                board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-                num_board_cards = len(board_cards)
-                stage = [0] * 4
-                if num_board_cards == 0:
-                    stage[0] = 1
-                elif num_board_cards == 3:
-                    stage[1] = 1
-                elif num_board_cards == 4:
-                    stage[2] = 1
-                elif num_board_cards == 5:
-                    stage[3] = 1
-                opponent_stats = OpponentStats()
-                action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else cfr_agent.action(state, player_id)
-                state.apply_action(action)
-            total_reward_vs_cfr += state.returns()[0]
-        winrates['CFR'].append(total_reward_vs_cfr / (num_games // 2))
-    
-        winrate_vs_pool = total_reward_vs_pool / num_games
-        exp_score = exploitability.exploitability(game, agent) if compute_exploitability else 0.0
-        agent.update_strategy_pool(winrate_vs_pool)
-        for key, values in winrates.items():
-            writer.add_scalar(f'Winrate/{key}', np.mean(values), agent.global_step)
-            writer.add_scalar(f'Winrate/{key}_Std', np.std(values), agent.global_step)
-        writer.add_scalar('Exploitability', exp_score, agent.global_step)
-        logging.info(f"Tournament: Pool={winrate_vs_pool:.4f}, Exploitability={exp_score:.4f}")
-        return winrate_vs_pool, exp_score
+def run_tournament(game, agent: PokerAgent, processor: StateProcessor, num_games: int = 50, compute_exploitability: bool = False) -> Tuple[float, float]:
+    from open_spiel.python.algorithms import exploitability, cfr
+    num_games = 200 if config.NUM_EPISODES > 10 else 50
+    total_reward_vs_pool = 0
+    total_reward_vs_tag = 0
+    total_reward_vs_lag = 0
+    total_reward_vs_random = 0
+    tag_agent = TightAggressiveAgent(game)
+    lag_agent = LooseAggressiveAgent(game)
+    cfr_agent = cfr.CFRSolver(game)
+    winrates = {'Pool': [], 'TAG': [], 'LAG': [], 'Random': [], 'CFR': []}
+
+    for _ in range(num_games):
+        state = game.new_initial_state()
+        opponents = [PokerAgent(game, processor) for _ in range(config.NUM_PLAYERS - 1)]
+        for opp in opponents:
+            if agent.strategy_pool:
+                opp.strategy_net.load_state_dict(random.choice([s['weights'] for s in agent.strategy_pool]))
+        while not state.is_terminal():
+            player_id = state.current_player()
+            bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
+            stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
+            info_tensor = state.information_state_tensor(player_id)
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+            stage = [0] * 4
+            if len(board_cards) == 0:
+                stage[0] = 1
+            elif len(board_cards) == 3:
+                stage[1] = 1
+            elif len(board_cards) == 4:
+                stage[2] = 1
+            elif len(board_cards) == 5:
+                stage[3] = 1
+            opponent_stats = OpponentStats()
+            action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else opponents[player_id - 1].step(state, player_id, bets, stacks, stage, opponent_stats)
+            state.apply_action(action)
+        total_reward_vs_pool += state.returns()[0]
+    winrates['Pool'].append(total_reward_vs_pool / num_games)
+
+    for _ in range(num_games):
+        state = game.new_initial_state()
+        tag_opponents = [tag_agent] * (config.NUM_PLAYERS - 1)
+        while not state.is_terminal():
+            player_id = state.current_player()
+            bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
+            stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
+            info_tensor = state.information_state_tensor(player_id)
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+            stage = [0] * 4
+            if len(board_cards) == 0:
+                stage[0] = 1
+            elif len(board_cards) == 3:
+                stage[1] = 1
+            elif len(board_cards) == 4:
+                stage[2] = 1
+            elif len(board_cards) == 5:
+                stage[3] = 1
+            opponent_stats = OpponentStats()
+            action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(tag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: tag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
+            state.apply_action(action)
+        total_reward_vs_tag += state.returns()[0]
+    winrates['TAG'].append(total_reward_vs_tag / num_games)
+
+    for _ in range(num_games):
+        state = game.new_initial_state()
+        lag_opponents = [lag_agent] * (config.NUM_PLAYERS - 1)
+        while not state.is_terminal():
+            player_id = state.current_player()
+            bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
+            stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
+            info_tensor = state.information_state_tensor(player_id)
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+            stage = [0] * 4
+            if len(board_cards) == 0:
+                stage[0] = 1
+            elif len(board_cards) == 3:
+                stage[1] = 1
+            elif len(board_cards) == 4:
+                stage[2] = 1
+            elif len(board_cards) == 5:
+                stage[3] = 1
+            opponent_stats = OpponentStats()
+            action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else max(lag_opponents[player_id - 1].action_probabilities(state, player_id), key=lambda x: lag_opponents[player_id - 1].action_probabilities(state, player_id)[x])
+            state.apply_action(action)
+        total_reward_vs_lag += state.returns()[0]
+    winrates['LAG'].append(total_reward_vs_lag / num_games)
+
+    for _ in range(num_games):
+        state = game.new_initial_state()
+        while not state.is_terminal():
+            player_id = state.current_player()
+            bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
+            stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
+            info_tensor = state.information_state_tensor(player_id)
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+            stage = [0] * 4
+            if len(board_cards) == 0:
+                stage[0] = 1
+            elif len(board_cards) == 3:
+                stage[1] = 1
+            elif len(board_cards) == 4:
+                stage[2] = 1
+            elif len(board_cards) == 5:
+                stage[3] = 1
+            opponent_stats = OpponentStats()
+            action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else random.choice(state.legal_actions(player_id))
+            state.apply_action(action)
+        total_reward_vs_random += state.returns()[0]
+    winrates['Random'].append(total_reward_vs_random / num_games)
+
+    total_reward_vs_cfr = 0
+    for _ in range(num_games // 2):
+        state = game.new_initial_state()
+        while not state.is_terminal():
+            player_id = state.current_player()
+            bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
+            stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
+            info_tensor = state.information_state_tensor(player_id)
+            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+            stage = [0] * 4
+            if len(board_cards) == 0:
+                stage[0] = 1
+            elif len(board_cards) == 3:
+                stage[1] = 1
+            elif len(board_cards) == 4:
+                stage[2] = 1
+            elif len(board_cards) == 5:
+                stage[3] = 1
+            opponent_stats = OpponentStats()
+            action = agent.step(state, 0, bets, stacks, stage, opponent_stats) if player_id == 0 else cfr_agent.action(state, player_id)
+            state.apply_action(action)
+        total_reward_vs_cfr += state.returns()[0]
+    winrates['CFR'].append(total_reward_vs_cfr / (num_games // 2))
+
+    winrate_vs_pool = total_reward_vs_pool / num_games
+    exp_score = exploitability.exploitability(game, agent) if compute_exploitability else 0.0
+    agent.update_strategy_pool(winrate_vs_pool)
+    for key, values in winrates.items():
+        writer.add_scalar(f'Winrate/{key}', np.mean(values), agent.global_step)
+        writer.add_scalar(f'Winrate/{key}_Std', np.std(values), agent.global_step)
+    writer.add_scalar('Exploitability', exp_score, agent.global_step)
+    logging.info(f"Tournament: Pool={winrate_vs_pool:.4f}, Exploitability={exp_score:.4f}")
+    return winrate_vs_pool, exp_score
 
 # ===== ОБУЧЕНИЕ =====
 class Trainer:
@@ -913,28 +901,32 @@ class Trainer:
         self.opponent_stats = OpponentStats()
 
     def _train_step(self, batch):
-        samples, indices, weights = batch
-        states, actions, rewards, next_states, dones, _, _, _, _ = zip(*samples)
-    
-        states = torch.tensor(states, dtype=torch.float32, device=device)
-        actions = torch.tensor(actions, dtype=torch.long, device=device)
-        rewards = torch.tensor([self.reward_normalizer.normalize(r) for r in rewards], dtype=torch.float32, device=device)
-        next_states = torch.tensor(next_states, dtype=torch.float32, device=device)
-        dones = torch.tensor(dones, dtype=torch.float32, device=device)
-        weights = torch.tensor(weights, dtype=torch.float32, device=device)
-    
-        self.agent.optimizer.zero_grad()
-        q_values = self.agent.regret_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        next_q_values = self.agent.strategy_net(next_states).max(1)[0]
-        targets = rewards + config.GAMMA * next_q_values * (1 - dones)
-        loss = (weights * (q_values - targets.detach()) ** 2).mean()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.agent.regret_net.parameters(), config.GRAD_CLIP_VALUE)
-        self.agent.optimizer.step()
-    
-        new_priorities = torch.abs(q_values - targets).detach().cpu().numpy() + 1e-5
-        self.buffer.update_priorities(indices, new_priorities)
-        return loss.item()
+        try:
+            samples, indices, weights = batch
+            states, actions, rewards, next_states, dones, _, _, _, _ = zip(*samples)
+        
+            states = torch.tensor(states, dtype=torch.float32, device=device)
+            actions = torch.tensor(actions, dtype=torch.long, device=device)
+            rewards = torch.tensor([self.reward_normalizer.normalize(r) for r in rewards], dtype=torch.float32, device=device)
+            next_states = torch.tensor(next_states, dtype=torch.float32, device=device)
+            dones = torch.tensor(dones, dtype=torch.float32, device=device)
+            weights = torch.tensor(weights, dtype=torch.float32, device=device)
+        
+            self.agent.optimizer.zero_grad()
+            q_values = self.agent.regret_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+            next_q_values = self.agent.strategy_net(next_states).max(1)[0]
+            targets = rewards + config.GAMMA * next_q_values * (1 - dones)
+            loss = (weights * (q_values - targets.detach()) ** 2).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.agent.regret_net.parameters(), config.GRAD_CLIP_VALUE)
+            self.agent.optimizer.step()
+        
+            new_priorities = torch.abs(q_values - targets).detach().cpu().numpy() + 1e-5
+            self.buffer.update_priorities(indices, new_priorities)
+            return loss.item()
+        except Exception as e:
+            logging.error(f"Ошибка в _train_step: {traceback.format_exc()}")
+            raise
 
     def _save_checkpoint(self, path, is_best=False):
         checkpoint = {
@@ -1022,8 +1014,6 @@ class Trainer:
                 if time.time() - self.last_checkpoint_time >= config.CHECKPOINT_INTERVAL:
                     self._save_checkpoint(config.MODEL_PATH)
     
-                # Очистка памяти
-                del all_experiences, results, futures
                 gc.collect()
                 torch.cuda.empty_cache()
     
@@ -1048,28 +1038,24 @@ class Trainer:
         ray.shutdown()
 
 # ===== ЗАПУСК =====
-import ray
-
 if __name__ == "__main__":
     mp.set_start_method('spawn')
     config = Config()
 
-    # Проверяем, активен ли Ray
     if ray.is_initialized():
         print("Ray уже инициализирован другой сессией. Завершаем новый запуск.")
         sys.exit(1)
 
-    # Инициализируем Ray с минимальными ресурсами
     ray.init(
         num_gpus=1,
-        num_cpus=8,  # Ограничиваем CPU
-        object_store_memory=2 * 1024 * 1024 * 1024,  # 2Gi для object store
-        _memory=4 * 1024 * 1024 * 1024,  # 4Gi для общей памяти Ray
+        num_cpus=8,
+        object_store_memory=2 * 1024 * 1024 * 1024,
+        _memory=4 * 1024 * 1024 * 1024,
         ignore_reinit_error=True,
-        configure_logging=False,  # Отключаем лишнее логирование Ray
+        configure_logging=False,
         _system_config={
-            "object_spilling_threshold": 0.8,  # Уменьшаем порог спиллинга
-            "max_io_workers": 1,  # Ограничиваем I/O воркеры
+            "object_spilling_threshold": 0.8,
+            "max_io_workers": 1,
         }
     )
 
