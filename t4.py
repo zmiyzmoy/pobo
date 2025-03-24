@@ -1,4 +1,4 @@
-# Импорт всех необходимых библиотек345678
+# Импорт всех необходимых библиотек3456780
 import os
 import time
 import logging
@@ -323,7 +323,8 @@ class StateProcessor:
             for r2 in range(r1, 13):
                 for suited in [0, 1]:
                     hand = [r1 + s1 * 13 for s1 in range(4)] + [r2 + s2 * 13 for s2 in range(4)]
-                    embedding = self.card_embedding(hand[:2]).cpu().detach().numpy()
+                    # Исправлено: явное преобразование в float32
+                    embedding = self.card_embedding(hand[:2]).float().cpu().detach().numpy().astype(np.float32)
                     all_hands.append(embedding)
         kmeans = KMeans(n_clusters=config.NUM_BUCKETS, random_state=42).fit(all_hands)
         joblib.dump(kmeans, config.KMEANS_PATH)
@@ -356,11 +357,9 @@ class StateProcessor:
                 private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
-        # Явно задаём float32 для тензоров в CardEmbedding
+        # Исправленный блок обработки карт
         card_embs = torch.stack([self.card_embedding(cards).float() for cards in cards_batch]).cpu().detach().numpy()
-        if card_embs.dtype != np.float32:
-            logging.debug(f"Converting card_embs from {card_embs.dtype} to float32")
-            card_embs = card_embs.astype(np.float32)
+        card_embs = card_embs.astype(np.float32)  # Явное преобразование в float32
         
         # Проверка перед predict
         logging.debug(f"card_embs shape={card_embs.shape}, dtype={card_embs.dtype}")
