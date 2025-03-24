@@ -302,9 +302,19 @@ class StateProcessor:
     def __init__(self):
         self.card_embedding = CardEmbedding()
         self.buckets = joblib.load(config.KMEANS_PATH)
-        self.cache = {}  # Заменяем на ограниченный кэш
-        self.max_cache_size = 1000  # Ограничим кэш до 1000 записей
-        logging.info("StateProcessor инициализирован")
+        self.cache = {}
+        self.max_cache_size = 1000
+        # Рассчитываем размер состояния
+        self.state_size = (
+            config.NUM_BUCKETS +       # bucket_one_hot
+            config.NUM_PLAYERS +       # bets_norm
+            config.NUM_PLAYERS +       # stacks_norm
+            config.NUM_PLAYERS +       # action_history
+            4 +                        # stages
+            5 +                        # sprs, table_aggs, positions, last_bets, all_in_flags
+            5                          # opp_features
+        )  # Итого: 82 при текущих настройках
+        logging.info(f"StateProcessor инициализирован, state_size={self.state_size}")
 
     def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
                 opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
@@ -394,13 +404,11 @@ class StateProcessor:
             logging.error(f"NaN/Inf in processed: {processed}")
             raise ValueError("Invalid state processing detected")
         
-        # Ограничиваем размер кэша
         if len(self.cache) >= self.max_cache_size:
             self.cache.clear()
         for key, proc in zip(state_keys, processed):
             self.cache[key] = proc
         
-        # Очистка памяти
         del card_embs, bucket_one_hot, bets_norm, stacks_norm, pots, sprs, positions, action_history, opp_features, table_aggs, last_bets, all_in_flags, features_list
         gc.collect()
         
