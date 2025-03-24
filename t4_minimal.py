@@ -1,3 +1,4 @@
+#^
 import os
 import time
 import logging
@@ -57,7 +58,7 @@ class Config:
         self.BB = 2
         self.MAX_STRATEGY_POOL = 10
         self.MAX_DICT_SIZE = 10000
-        self.REWARD_NORMALIZATION = 'stack'  # или 'bb' для нормализации по большому блайнду
+        self.REWARD_NORMALIZATION = 'stack'
         self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2 3 4 5 6,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
 
 config = Config()
@@ -159,12 +160,17 @@ class CardEmbedding(nn.Module):
         super().__init__()
         self.rank_embed = nn.Embedding(13, 8).to(device)
         self.suit_embed = nn.Embedding(4, 4).to(device)
+        # Установка float32 для весов
+        self.rank_embed.weight.data = self.rank_embed.weight.data.to(dtype=torch.float32)
+        self.suit_embed.weight.data = self.suit_embed.weight.data.to(dtype=torch.float32)
         logging.info("CardEmbedding инициализирован")
 
     def forward(self, cards: List[int]) -> torch.Tensor:
         ranks = torch.tensor([c % 13 for c in cards], dtype=torch.long, device=device)
         suits = torch.tensor([c // 13 for c in cards], dtype=torch.long, device=device)
-        return torch.cat([self.rank_embed(ranks).mean(dim=0), self.suit_embed(suits).mean(dim=0)])
+        rank_emb = self.rank_embed(ranks).mean(dim=0).to(dtype=torch.float32)
+        suit_emb = self.suit_embed(suits).mean(dim=0).to(dtype=torch.float32)
+        return torch.cat([rank_emb, suit_emb]).to(dtype=torch.float32)
 
 # Статистика оппонентов
 class OpponentStats:
@@ -258,7 +264,7 @@ class StateProcessor:
             for r2 in range(r1, 13):
                 for suited in [0, 1]:
                     hand = [r1 + suited * 13, r2 + suited * 13]
-                    embedding = self.card_embedding(hand).cpu().detach().numpy()
+                    embedding = self.card_embedding(hand).cpu().detach().numpy().astype(np.float32)
                     all_hands.append(embedding)
         kmeans = KMeans(n_clusters=config.NUM_BUCKETS, random_state=42).fit(all_hands)
         joblib.dump(kmeans, config.KMEANS_PATH)
@@ -292,8 +298,11 @@ class StateProcessor:
                 private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
-        card_embs = torch.stack([self.card_embedding(cards).to(dtype=torch.float32) for cards in cards_batch])
+        card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).to(dtype=torch.float32)
         card_embs = card_embs.cpu().detach().numpy().astype(np.float32)
+        if card_embs.dtype != np.float32:
+            logging.error(f"card_embs имеет тип {card_embs.dtype}, ожидается float32")
+            card_embs = card_embs.astype(np.float32)
         bucket_idxs = self.buckets.predict(card_embs)
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
@@ -469,7 +478,6 @@ def collect_experience(game, agent, processor, steps, worker_id):
             next_state = env.clone()
             next_state.apply_action(action)
             raw_reward = next_state.returns()[player_id] if next_state.is_terminal() else 0
-            # Нормализация награды
             if config.REWARD_NORMALIZATION == 'stack':
                 reward = raw_reward / max(stacks[player_id], 1e-8)
             elif config.REWARD_NORMALIZATION == 'bb':
