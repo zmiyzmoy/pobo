@@ -1,3 +1,4 @@
+#3
 import os
 import time
 import logging
@@ -291,7 +292,9 @@ class StateProcessor:
                 private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
-        card_embs = torch.stack([self.card_embedding(cards).float() for cards in cards_batch]).cpu().detach().numpy().astype(np.float32)
+        # Явное приведение к float32 на всех этапах
+        card_embs = torch.stack([self.card_embedding(cards).to(dtype=torch.float32) for cards in cards_batch])
+        card_embs = card_embs.cpu().detach().numpy().astype(np.float32)
         bucket_idxs = self.buckets.predict(card_embs)
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
@@ -341,7 +344,6 @@ class StateProcessor:
             self.cache[key] = proc
         
         return processed
-
 # Агент с поддержкой PSRO
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor):
