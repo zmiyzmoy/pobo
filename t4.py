@@ -522,52 +522,53 @@ class PokerAgent(policy.Policy):
             base = max(base, last_opp_bet * 1.1)
         return base
 
-    def action_probabilities(self, state, player_id: Optional[int] = None) -> Dict[int, float]:
-        legal_actions = state.legal_actions(player_id)
-        if not legal_actions:
-            return {0: 1.0}
-        info_state = state.information_state_string(player_id)
-        bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
-        stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
-        # Определяем стадию по количеству карт на столе вместо round()
-        info_tensor = state.information_state_tensor(player_id)
-        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-        num_board_cards = len(board_cards)
-        stage = [0] * 4
-        if num_board_cards == 0:
-            stage[0] = 1  # Префлоп
-        elif num_board_cards == 3:
-            stage[1] = 1  # Флоп
-        elif num_board_cards == 4:
-            stage[2] = 1  # Терн
-        elif num_board_cards == 5:
-            stage[3] = 1  # Ривер
-        opponent_stats = OpponentStats()
-        state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
+    def action_probabilities(self, state, player_id: Optional[int] = None, opponent_stats: Optional[OpponentStats] = None) -> Dict[int, float]:
+    legal_actions = state.legal_actions(player_id)
+    if not legal_actions:
+        return {0: 1.0}
+    info_state = state.information_state_string(player_id)
+    bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
+    stacks = state.stacks() if hasattr(state, 'stacks') else [1000] * config.NUM_PLAYERS
+    # Определяем стадию по количеству карт на столе вместо round()
+    info_tensor = state.information_state_tensor(player_id)
+    board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+    num_board_cards = len(board_cards)
+    stage = [0] * 4
+    if num_board_cards == 0:
+        stage[0] = 1  # Префлоп
+    elif num_board_cards == 3:
+        stage[1] = 1  # Флоп
+    elif num_board_cards == 4:
+        stage[2] = 1  # Терн
+    elif num_board_cards == 5:
+        stage[3] = 1  # Ривер
+    # Используем переданный opponent_stats или создаем пустой, если его нет
+    opponent_stats = opponent_stats if opponent_stats is not None else OpponentStats()
+    state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
 
-        with torch.no_grad():
-            regrets = self.regret_net(state_tensor)[0]
-            strategy_logits = self.strategy_net(state_tensor)[0]
-            legal_mask = torch.zeros(self.num_actions, device=device)
-            legal_mask[legal_actions] = 1
-            strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
-            strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
+    with torch.no_grad():
+        regrets = self.regret_net(state_tensor)[0]
+        strategy_logits = self.strategy_net(state_tensor)[0]
+        legal_mask = torch.zeros(self.num_actions, device=device)
+        legal_mask[legal_actions] = 1
+        strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
+        strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
 
-        if info_state not in self.cumulative_regrets:
-            self.cumulative_regrets[info_state] = np.zeros(self.num_actions)
-            self.cumulative_strategies[info_state] = np.zeros(self.num_actions)
-        self.cumulative_regrets[info_state][legal_actions] += regrets[legal_actions].cpu().numpy()
-        positive_regrets = np.maximum(self.cumulative_regrets[info_state][legal_actions], 0)
-        total_regret = positive_regrets.sum()
-        probs = positive_regrets / total_regret if total_regret > 0 else strategy[legal_actions] / strategy[legal_actions].sum()
-        self.cumulative_strategies[info_state][legal_actions] += probs
-        if len(self.strategy_pool) < 5 and random.random() < 0.1:
-            self.strategy_pool.append({'weights': copy.deepcopy(self.strategy_net.state_dict()), 'winrate': 0.0})
-        return {a: float(p) for a, p in zip(legal_actions, probs)}
+    if info_state not in self.cumulative_regrets:
+        self.cumulative_regrets[info_state] = np.zeros(self.num_actions)
+        self.cumulative_strategies[info_state] = np.zeros(self.num_actions)
+    self.cumulative_regrets[info_state][legal_actions] += regrets[legal_actions].cpu().numpy()
+    positive_regrets = np.maximum(self.cumulative_regrets[info_state][legal_actions], 0)
+    total_regret = positive_regrets.sum()
+    probs = positive_regrets / total_regret if total_regret > 0 else strategy[legal_actions] / strategy[legal_actions].sum()
+    self.cumulative_strategies[info_state][legal_actions] += probs
+    if len(self.strategy_pool) < 5 and random.random() < 0.1:
+        self.strategy_pool.append({'weights': copy.deepcopy(self.strategy_net.state_dict()), 'winrate': 0.0})
+    return {a: float(p) for a, p in zip(legal_actions, probs)}
 
     def step(self, state, player_id: int, bets: List[float], stacks: List[float], stage: List[int], opponent_stats: OpponentStats) -> int:
         epsilon = max(0.1, 1.0 - self.global_step / 100000)
-        probs = self.action_probabilities(state, player_id)
+        probs = self.action_probabilities(state, player_id, opponent_stats)  # Передаем opponent_stats
         action = random.choice(list(probs.keys())) if random.random() < epsilon else max(probs, key=probs.get)
         if action > 1:
             state_tensor = torch.FloatTensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats)).to(device)
