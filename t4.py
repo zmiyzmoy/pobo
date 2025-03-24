@@ -1,4 +1,4 @@
-# Импорт всех необходимых библиотек345
+# Импорт всех необходимых библиотек3456
 import os
 import time
 import logging
@@ -357,7 +357,8 @@ class StateProcessor:
             cards_batch.append(private_cards)
         
         # Явно задаём float32 для тензоров в CardEmbedding
-        card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
+        card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch], dtype=torch.float32).cpu().detach().numpy()
+        # card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
         if card_embs.dtype != np.float32:
             logging.debug(f"Converting card_embs from {card_embs.dtype} to float32")
             card_embs = card_embs.astype(np.float32)
