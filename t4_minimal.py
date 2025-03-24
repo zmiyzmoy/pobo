@@ -1,3 +1,4 @@
+#19
 import os
 import time
 import logging
@@ -163,12 +164,84 @@ class CardEmbedding(nn.Module):
         suits = torch.tensor([c // 13 for c in cards], dtype=torch.long, device=device)
         return torch.cat([self.rank_embed(ranks).mean(dim=0), self.suit_embed(suits).mean(dim=0)])
 
+# Статистика оппонентов
+class OpponentStats:
+    def __init__(self):
+        self.stats = {i: {
+            'vpip': 0, 'pfr': 0, 'af': 0, 'hands': 0, 'folds': 0, 'calls': 0, 'raises': 0, 'last_bet': 0,
+            'fold_to_cbet': 0, 'cbet_opp': 0, 'fold_to_3bet': 0, '3bet_opp': 0, 'check_raise': 0, 'check_opp': 0,
+            'pos_winrate': {pos: {'wins': 0, 'hands': 0} for pos in range(config.NUM_PLAYERS)},
+            'call_vs_raise_freq': 0, 'raise_opp': 0, 'street_aggression': [0] * 4
+        } for i in range(config.NUM_PLAYERS)}
+
+    def update(self, player_id: int, action: int, stage: List[int], pot: float, bet_size: float, is_blind: bool, position: int, 
+               is_cbet: bool = False, is_3bet: bool = False, is_check: bool = False, won: float = 0, is_raise: bool = False):
+        stage_idx = np.argmax(stage)
+        self.stats[player_id]['hands'] += 1
+        self.stats[player_id]['pos_winrate'][position]['hands'] += 1
+        if won > 0:
+            self.stats[player_id]['pos_winrate'][position]['wins'] += 1
+        if stage_idx == 0 and not is_blind:
+            if action > 0:
+                self.stats[player_id]['vpip'] += 1
+            if action > 1:
+                self.stats[player_id]['pfr'] += 1
+        if action == 0:
+            self.stats[player_id]['folds'] += 1
+            if is_cbet:
+                self.stats[player_id]['fold_to_cbet'] += 1
+            if is_3bet:
+                self.stats[player_id]['fold_to_3bet'] += 1
+        elif action == 1:
+            self.stats[player_id]['calls'] += 1
+            if is_raise:
+                self.stats[player_id]['call_vs_raise_freq'] += 1
+        elif action > 1:
+            self.stats[player_id]['raises'] += bet_size
+            self.stats[player_id]['last_bet'] = bet_size
+            self.stats[player_id]['street_aggression'][stage_idx] += 1
+            if is_check:
+                self.stats[player_id]['check_raise'] += 1
+        if is_cbet:
+            self.stats[player_id]['cbet_opp'] += 1
+        if is_3bet:
+            self.stats[player_id]['3bet_opp'] += 1
+        if is_check:
+            self.stats[player_id]['check_opp'] += 1
+        if is_raise:
+            self.stats[player_id]['raise_opp'] += 1
+        total_actions = self.stats[player_id]['folds'] + self.stats[player_id]['calls'] + self.stats[player_id]['raises']
+        if total_actions > 0:
+            self.stats[player_id]['af'] = self.stats[player_id]['raises'] / total_actions
+
+    def get_metrics(self, player_id: int) -> Dict[str, float]:
+        hands = max(self.stats[player_id]['hands'], 1)
+        cbet_opp = max(self.stats[player_id]['cbet_opp'], 1)
+        threebet_opp = max(self.stats[player_id]['3bet_opp'], 1)
+        check_opp = max(self.stats[player_id]['check_opp'], 1)
+        raise_opp = max(self.stats[player_id]['raise_opp'], 1)
+        pos_stats = {pos: self.stats[player_id]['pos_winrate'][pos]['wins'] / max(self.stats[player_id]['pos_winrate'][pos]['hands'], 1)
+                     for pos in range(config.NUM_PLAYERS)}
+        return {
+            'vpip': float(self.stats[player_id]['vpip'] / hands),
+            'pfr': float(self.stats[player_id]['pfr'] / hands),
+            'af': float(self.stats[player_id]['af']),
+            'fold_freq': float(self.stats[player_id]['folds'] / hands),
+            'last_bet': float(self.stats[player_id]['last_bet']),
+            'fold_to_cbet': float(self.stats[player_id]['fold_to_cbet'] / cbet_opp),
+            'fold_to_3bet': float(self.stats[player_id]['fold_to_3bet'] / threebet_opp),
+            'check_raise_freq': float(self.stats[player_id]['check_raise'] / check_opp),
+            'call_vs_raise_freq': float(self.stats[player_id]['call_vs_raise_freq'] / raise_opp),
+            'street_aggression': [float(agg / max(hands, 1)) for agg in self.stats[player_id]['street_aggression']],
+            'pos_winrate': pos_stats
+        }
+
 # Обработка состояний
 class StateProcessor:
     def __init__(self):
         self.card_embedding = CardEmbedding()
         self.buckets = self._load_or_precompute_buckets()
-        self.state_size = config.NUM_BUCKETS + config.NUM_PLAYERS * 3 + 4 + 5
+        self.state_size = config.NUM_BUCKETS + config.NUM_PLAYERS * 3 + 4 + 5 + 5  # +5 для opp_features
         self.cache = {}
         self.max_cache_size = 1000
         logging.info(f"StateProcessor инициализирован, state_size={self.state_size}")
@@ -191,7 +264,8 @@ class StateProcessor:
         return kmeans
 
     def process(self, states: List, player_ids: List[int], bets: List[List[float]] = None, 
-                stacks: List[List[float]] = None, stages: List[List[int]] = None) -> np.ndarray:
+                stacks: List[List[float]] = None, stages: List[List[int]] = None, 
+                opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
         batch_size = len(states)
         if bets is None:
             bets = [[0] * config.NUM_PLAYERS] * batch_size
@@ -216,7 +290,7 @@ class StateProcessor:
                 private_cards.extend([1] * (2 - len(private_cards)))
             cards_batch.append(private_cards)
         
-        card_embs = torch.stack([self.card_embedding(cards).float() for cards in cards_batch]).cpu().detach().numpy()
+        card_embs = torch.stack([self.card_embedding(cards).float() for cards in cards_batch]).cpu().detach().numpy().astype(np.float32)
         bucket_idxs = self.buckets.predict(card_embs)
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
         bucket_one_hot[np.arange(batch_size), bucket_idxs] = 1.0
@@ -231,9 +305,29 @@ class StateProcessor:
                                    [min(h, 4) for h in s.action_history()[-config.NUM_PLAYERS:]]) 
                                    for s in states], dtype=np.float32)
         
+        opponent_metrics = [[opponent_stats.get_metrics(i) for i in range(config.NUM_PLAYERS) if i != pid] 
+                            if opponent_stats else [] for pid in player_ids]
+        opp_features = []
+        for metrics in opponent_metrics:
+            if metrics:
+                agg_vpip = float(np.mean([float(m['vpip']) for m in metrics]))
+                agg_pfr = float(np.mean([float(m['pfr']) for m in metrics]))
+                agg_fold_to_cbet = float(np.mean([float(m['fold_to_cbet']) for m in metrics]))
+                agg_fold_to_3bet = float(np.mean([float(m['fold_to_3bet']) for m in metrics]))
+                agg_street_agg = float(np.mean([float(np.mean(m['street_aggression'])) for m in metrics]))
+            else:
+                agg_vpip = 0.5
+                agg_pfr = 0.5
+                agg_fold_to_cbet = 0.5
+                agg_fold_to_3bet = 0.5
+                agg_street_agg = 0.5
+            opp_features.append([agg_vpip, agg_pfr, agg_fold_to_cbet, agg_fold_to_3bet, agg_street_agg])
+        opp_features = np.array(opp_features, dtype=np.float32)
+        
         processed = np.concatenate([
             bucket_one_hot, bets_norm, stacks_norm, action_history, np.array(stages, dtype=np.float32),
-            np.array([sprs, positions, np.zeros(batch_size), np.zeros(batch_size), np.zeros(batch_size)], dtype=np.float32).T
+            np.array([sprs, positions, np.zeros(batch_size), np.zeros(batch_size), np.zeros(batch_size)], dtype=np.float32).T,
+            opp_features
         ], axis=1).astype(np.float32)
         
         if np.any(np.isnan(processed)) or np.any(np.isinf(processed)):
@@ -264,11 +358,24 @@ class PokerAgent(policy.Policy):
         self.global_step = 0
         logging.info(f"PokerAgent инициализирован, state_size={processor.state_size}, num_actions={self.num_actions}")
 
-    def action_probabilities(self, state, player_id: Optional[int] = None) -> Dict[int, float]:
+    def action_probabilities(self, state, player_id: Optional[int] = None, opponent_stats: Optional[OpponentStats] = None) -> Dict[int, float]:
         legal_actions = state.legal_actions(player_id)
         if not legal_actions:
             return {0: 1.0}
-        state_tensor = torch.tensor(self.processor.process([state], [player_id]), 
+        bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
+        stacks = state.stacks() if hasattr(state, 'stacks') else [100] * config.NUM_PLAYERS
+        info_tensor = state.information_state_tensor(player_id)
+        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+        stage = [0] * 4
+        if len(board_cards) == 0:
+            stage[0] = 1
+        elif len(board_cards) == 3:
+            stage[1] = 1
+        elif len(board_cards) == 4:
+            stage[2] = 1
+        elif len(board_cards) == 5:
+            stage[3] = 1
+        state_tensor = torch.tensor(self.processor.process([state], [player_id], [bets], [stacks], [stage], opponent_stats), 
                                   dtype=torch.float32, device=device)
         with torch.no_grad():
             self.strategy_net.eval()
@@ -281,8 +388,8 @@ class PokerAgent(policy.Policy):
         probs_dict = {a: float(strategy[a]) for a in legal_actions}
         return probs_dict
 
-    def step(self, state, player_id):
-        probs = self.action_probabilities(state, player_id)
+    def step(self, state, player_id, opponent_stats: OpponentStats):
+        probs = self.action_probabilities(state, player_id, opponent_stats)
         action = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
         return action
 
@@ -292,9 +399,15 @@ def collect_experience(game, agent, processor, steps, worker_id):
     try:
         env = game.new_initial_state()
         experiences = []
+        opponent_stats = OpponentStats()
         step_count = 0
         while step_count < steps:
             if env.is_terminal():
+                returns = env.returns()
+                for pid in range(config.NUM_PLAYERS):
+                    pos = (pid - (env.current_player() if not env.is_terminal() else 0) + config.NUM_PLAYERS) % config.NUM_PLAYERS
+                    opponent_stats.update(pid, 0, [0, 0, 0, 0], sum(env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS), 
+                                        0, False, pos, won=returns[pid])
                 env = game.new_initial_state()
                 continue
             player_id = env.current_player()
@@ -315,10 +428,14 @@ def collect_experience(game, agent, processor, steps, worker_id):
                 stage[2] = 1
             elif len(board_cards) == 5:
                 stage[3] = 1
-            action = agent.step(env, player_id)
+            action = agent.step(env, player_id, opponent_stats)
             next_state = env.clone()
             next_state.apply_action(action)
             reward = next_state.returns()[player_id] if next_state.is_terminal() else 0
+            is_blind = player_id in [0, 1] and sum(bets) <= config.BB * 2
+            position = (player_id - env.current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
+            bet_size = bets[player_id] if action > 1 else 0
+            opponent_stats.update(player_id, action, stage, sum(bets), bet_size, is_blind, position)
             experiences.append((env.clone(), player_id, action, reward, next_state.clone(), next_state.is_terminal(), bets, stacks, stage))
             env = next_state
             step_count += 1
@@ -352,12 +469,19 @@ class Trainer:
                     batch, indices, weights = self.buffer.sample(config.BATCH_SIZE, self.beta)
                     states, player_ids, actions, rewards, next_states, dones, bets, stacks, stages = zip(*batch)
                     
-                    states = torch.tensor(self.processor.process(states, player_ids, bets, stacks, stages), 
+                    opponent_stats = OpponentStats()
+                    for exp in experiences:
+                        is_blind = exp[1] in [0, 1] and sum(exp[6]) <= config.BB * 2
+                        position = (exp[1] - exp[0].current_player() + config.NUM_PLAYERS) % config.NUM_PLAYERS
+                        bet_size = exp[6][exp[1]] if exp[2] > 1 else 0
+                        opponent_stats.update(exp[1], exp[2], exp[8], sum(exp[6]), bet_size, is_blind, position)
+                    
+                    states = torch.tensor(self.processor.process(states, player_ids, bets, stacks, stages, opponent_stats), 
                                         dtype=torch.float32, device=device)
                     actions = torch.tensor(actions, dtype=torch.long, device=device)
                     rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
                     next_player_ids = [s.current_player() if s.current_player() >= 0 else 0 for s in next_states]
-                    next_states = torch.tensor(self.processor.process(next_states, next_player_ids, stacks, stacks, stages), 
+                    next_states = torch.tensor(self.processor.process(next_states, next_player_ids, stacks, stacks, stages, opponent_stats), 
                                              dtype=torch.float32, device=device)
                     weights = torch.tensor(weights, dtype=torch.float32, device=device)
                     
