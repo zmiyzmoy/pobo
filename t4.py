@@ -1,4 +1,4 @@
-# Импорт всех необходимых библиотек1
+# Импорт всех необходимых библиотек2
 import os
 import time
 import logging
@@ -343,7 +343,6 @@ class StateProcessor:
         else:
             suit_mapping = {s: random.randint(0, 3) for s in set(original_suits)}
             return [r + suit_mapping[s] * 13 for r, s in zip(original_ranks, original_suits)]
-
     def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
             opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
     batch_size = len(states)
