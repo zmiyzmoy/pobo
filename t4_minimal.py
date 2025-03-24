@@ -1,4 +1,4 @@
-#^r
+#^re
 import os
 import time
 import logging
@@ -359,6 +359,7 @@ class StateProcessor:
         return processed
 
 # Агент с поддержкой PSRO
+# Агент с поддержкой PSRO
 class PokerAgent(policy.Policy):
     def __init__(self, game, processor):
         player_ids = list(range(game.num_players()))
@@ -401,9 +402,11 @@ class PokerAgent(policy.Policy):
         
         with torch.no_grad():
             self.strategy_net.eval()
+            self.regret_net.eval()  # Переводим regret_net в режим eval
             strategy_logits = self.strategy_net(state_tensor)[0]
-            self.strategy_net.train()
             q_values = self.regret_net(state_tensor)[0]
+            self.strategy_net.train()
+            self.regret_net.train()  # Возвращаем regret_net в режим train
             legal_mask = torch.zeros(self.num_actions, device=device)
             legal_mask[legal_actions] = 1
             strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
@@ -443,7 +446,6 @@ class PokerAgent(policy.Policy):
         self.strategy_pool.append(strategy_dict)
         self.cumulative_strategies.clear()
         logging.info(f"Strategy pool updated, size: {len(self.strategy_pool)}")
-
 # Сбор опыта
 @ray.remote(num_cpus=1, num_gpus=0.5)
 def collect_experience(game, agent, processor, steps, worker_id):
