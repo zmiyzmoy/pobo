@@ -21,7 +21,7 @@ from open_spiel.python import policy
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Измените с INFO на DEBUG
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('training_output.log'),
