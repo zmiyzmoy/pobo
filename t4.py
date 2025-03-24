@@ -57,6 +57,7 @@ class Config:
         self.NUM_BUCKETS = 50
         self.BB = 2
         self.GAME_NAME = "universal_poker(betting=nolimit,numPlayers=6,numRounds=4,blind=1 2 3 4 5 6,raiseSize=0.10 0.20 0.40 0.80,stack=100 100 100 100 100 100,numSuits=4,numRanks=13,numHoleCards=2,numBoardCards=0 3 1 1)"
+
 # Инициализация
 config = Config()
 os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
@@ -284,6 +285,7 @@ class OpponentStats:
         raise_opp = max(self.stats[player_id]['raise_opp'], 1)
         pos_stats = {pos: self.stats[player_id]['pos_winrate'][pos]['wins'] / max(self.stats[player_id]['pos_winrate'][pos]['hands'], 1)
                      for pos in range(config.NUM_PLAYERS)}
+        # Исправление: Явное приведение всех значений к float
         return {
             'vpip': float(self.stats[player_id]['vpip'] / hands),
             'pfr': float(self.stats[player_id]['pfr'] / hands),
@@ -380,15 +382,15 @@ class StateProcessor:
         all_in_flags = [1.0 if any(b >= stk[i] for i, b in enumerate(bet) if i != pid) else 0.0 
                         for bet, stk, pid in zip(bets, stacks, player_ids)]
 
-        # Исправление: Преобразуем opponent_metrics в числовой массив, убираем словари
+        # Исправление: Преобразуем opponent_metrics в числовой массив, убираем словари и явно приводим к float
         opp_features = []
         for metrics in opponent_metrics:
             if metrics:
-                agg_vpip = np.mean([float(m['vpip']) for m in metrics])
-                agg_pfr = np.mean([float(m['pfr']) for m in metrics])
-                agg_fold_to_cbet = np.mean([float(m['fold_to_cbet']) for m in metrics])
-                agg_fold_to_3bet = np.mean([float(m['fold_to_3bet']) for m in metrics])
-                agg_street_agg = np.mean([float(np.mean(m['street_aggression'])) for m in metrics])
+                agg_vpip = float(np.mean([float(m['vpip']) for m in metrics]))
+                agg_pfr = float(np.mean([float(m['pfr']) for m in metrics]))
+                agg_fold_to_cbet = float(np.mean([float(m['fold_to_cbet']) for m in metrics]))
+                agg_fold_to_3bet = float(np.mean([float(m['fold_to_3bet']) for m in metrics]))
+                agg_street_agg = float(np.mean([float(np.mean(m['street_aggression'])) for m in metrics]))
             else:
                 agg_vpip = 0.5
                 agg_pfr = 0.5
@@ -398,7 +400,7 @@ class StateProcessor:
             opp_features.append([agg_vpip, agg_pfr, agg_fold_to_cbet, agg_fold_to_3bet, agg_street_agg])
         opp_features = np.array(opp_features, dtype=np.float32)
 
-        # Проверка на нечисловые значения
+        # Исправление: Проверка на нечисловые значения
         assert all(isinstance(x, (float, np.floating)) for feat in opp_features for x in feat), "Non-numeric values in opp_features"
 
         processed = np.concatenate([
@@ -576,6 +578,7 @@ class PokerAgent(policy.Policy):
             self.best_winrate = max(self.best_winrate, winrate)
         if len(self.strategy_pool) > 10:
             self.strategy_pool = sorted(self.strategy_pool, key=lambda x: x['winrate'], reverse=True)[:10]
+
 # ===== СБОР ДАННЫХ =====
 @ray.remote(num_gpus=1)
 def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps: int, worker_id: int, queue: Queue):
@@ -672,6 +675,7 @@ def collect_experience(game, agent: PokerAgent, processor: StateProcessor, steps
         logging.error(f"Worker {worker_id} failed: {traceback.format_exc()}\nLast state: Not available (terminal state issue)\nBets: {locals().get('bets', 'N/A')}\nStacks: {locals().get('stacks', 'N/A')}")
         queue.put(([], OpponentStats(), 0))
         return ([], OpponentStats(), 0)
+
 # ===== ТЕСТИРОВАНИЕ =====
 class TightAggressiveAgent(pyspiel.Policy):
     def __init__(self, game):
@@ -1054,6 +1058,7 @@ class Trainer:
 
         pbar.close()
         writer.close()
+
 # ===== ЗАПУСК =====
 if __name__ == "__main__":
     mp.set_start_method('spawn')
