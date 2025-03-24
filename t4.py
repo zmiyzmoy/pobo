@@ -345,7 +345,7 @@ class StateProcessor:
             return [r + suit_mapping[s] * 13 for r, s in zip(original_ranks, original_suits)]
 
     def process(self, states: List, player_ids: List[int], bets: List[List[float]], stacks: List[List[float]], stages: List[List[int]], 
-            opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
+                opponent_stats: Optional[OpponentStats] = None) -> np.ndarray:
         batch_size = len(states)
         logging.debug(f"Processing batch_size={batch_size}, player_ids={player_ids}")
         
@@ -360,8 +360,17 @@ class StateProcessor:
         
         # Преобразуем состояния в тензоры
         info_states = [s.information_state_tensor(pid) for s, pid in zip(states, player_ids)]
-        cards_batch = [[int(c) for i, c in enumerate(info[:52]) if c >= 0 and i in s.player_cards(pid)] 
-                       for info, s, pid in zip(info_states, states, player_ids)]
+        
+        # Извлекаем приватные карты игрока из information_state_tensor
+        cards_batch = []
+        for info in info_states:
+            private_cards = [int(i) for i, c in enumerate(info[:52]) if c > 0]  # Первые 52 — hole cards
+            if len(private_cards) != 2:  # В Texas Hold'em всегда 2 карты у игрока
+                logging.error(f"Invalid number of private cards: {private_cards}")
+                raise ValueError(f"Expected 2 private cards, got {len(private_cards)}")
+            cards_batch.append(private_cards)
+        
+        # Преобразуем карты в эмбеддинги
         card_embs = torch.stack([self.card_embedding(cards) for cards in cards_batch]).cpu().detach().numpy()
         bucket_idxs = self.buckets.predict(card_embs)
         bucket_one_hot = np.zeros((batch_size, config.NUM_BUCKETS), dtype=np.float32)
@@ -437,7 +446,7 @@ class StateProcessor:
         
         # Сохраняем в кэш и возвращаем
         for key, proc in zip(state_keys, processed):
-            self.cache[key] = proc  # Сохраняем результат в словаре
+            self.cache[key] = proc
         return processed
 # ===== АГЕНТ =====
 class PokerAgent(policy.Policy):
