@@ -514,29 +514,47 @@ class Trainer:
         self.buffer = PrioritizedReplayBuffer(config.BUFFER_CAPACITY)
         self.global_step = 0
         self.beta = 0.4
+        self.load_checkpoint()  # Загружаем чекпоинт при инициализации
 
-# Обучение
-class Trainer:
-    def __init__(self, game, agent, processor):
-        self.game = game
-        self.agent = agent
-        self.processor = processor
-        self.buffer = PrioritizedReplayBuffer(config.BUFFER_CAPACITY)
-        self.global_step = 0
-        self.beta = 0.4
+    def load_checkpoint(self):
+        if os.path.exists(config.MODEL_PATH):
+            checkpoint = torch.load(config.MODEL_PATH)
+            self.agent.regret_net.load_state_dict(checkpoint['regret_net'])
+            self.agent.strategy_net.load_state_dict(checkpoint['strategy_net'])
+            self.agent.optimizer.load_state_dict(checkpoint['optimizer'])
+            self.buffer.buffer = checkpoint['buffer']
+            self.buffer.priorities = checkpoint['priorities']
+            self.buffer._max_priority = checkpoint['max_priority']
+            self.global_step = checkpoint['global_step']
+            self.beta = checkpoint['beta']
+            logging.info(f"Loaded checkpoint from {config.MODEL_PATH} at step {self.global_step}")
+        else:
+            logging.info("No checkpoint found, starting fresh")
+
+    def save_checkpoint(self):
+        checkpoint = {
+            'regret_net': self.agent.regret_net.state_dict(),
+            'strategy_net': self.agent.strategy_net.state_dict(),
+            'optimizer': self.agent.optimizer.state_dict(),
+            'buffer': self.buffer.buffer,
+            'priorities': self.buffer.priorities,
+            'max_priority': self.buffer._max_priority,
+            'global_step': self.global_step,
+            'beta': self.beta
+        }
+        torch.save(checkpoint, config.MODEL_PATH)
+        logging.info(f"Saved checkpoint to {config.MODEL_PATH} at step {self.global_step}")
 
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
         for episode in range(config.NUM_EPISODES):
             logging.info(f"Starting episode {episode}")
-            # Запускаем сбор опыта для всех воркеров
             logging.debug(f"Launching {config.NUM_WORKERS} workers")
             futures = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i)
                        for i in range(config.NUM_WORKERS)]
             logging.debug(f"Waiting for {len(futures)} futures")
             all_experiences = ray.get(futures)
             
-            # Объединяем опыт от всех воркеров
             experiences = []
             for i, worker_experiences in enumerate(all_experiences):
                 logging.info(f"Worker {i} returned {len(worker_experiences)} experiences")
@@ -585,6 +603,7 @@ class Trainer:
                     self.beta = min(1.0, self.beta + 0.001)
                 
                 self.agent.update_strategy_pool()
+                self.save_checkpoint()  # Сохраняем чекпоинт после каждого эпизода
             
             pbar.update(1)
         pbar.close()
