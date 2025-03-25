@@ -528,6 +528,7 @@ class Trainer:
         self.beta = 0.4
         self.interrupted = False
         self.last_checkpoint_time = time.time()
+        self.best_avg_reward = float('-inf')
         self.load_checkpoint()
 
     def load_checkpoint(self):
@@ -543,7 +544,7 @@ class Trainer:
             self.reward_normalizer.rewards = checkpoint.get('reward_buffer', deque(maxlen=config.BUFFER_CAPACITY))
             logging.info(f"Loaded checkpoint from {config.MODEL_PATH} at step {self.global_step}")
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, is_best=False):
         checkpoint = {
             'regret_net': self.agent.regret_net.state_dict(),
             'strategy_net': self.agent.strategy_net.state_dict(),
@@ -555,20 +556,28 @@ class Trainer:
             'reward_buffer': self.reward_normalizer.rewards
         }
         torch.save(checkpoint, config.MODEL_PATH)
+        if is_best:
+            torch.save(checkpoint, config.BEST_MODEL_PATH)
+            logging.info(f"Saved best model to {config.BEST_MODEL_PATH} at step {self.global_step}")
         self.last_checkpoint_time = time.time()
         logging.info(f"Saved checkpoint to {config.MODEL_PATH} at step {self.global_step}")
 
     def run_tournament(self):
-        num_games = 50
+        num_games = 20  # Уменьшено для скорости
         total_reward = {'self': 0, 'tight': 0, 'loose': 0}
         tag_agent = TightAggressiveAgent(self.game)
         lag_agent = LooseAggressiveAgent(self.game)
+        opponent_stats = OpponentStats()
 
         for opp_type, opp in [('self', self.agent), ('tight', tag_agent), ('loose', lag_agent)]:
-            for _ in range(num_games):
+            for game_idx in range(num_games):
                 state = self.game.new_initial_state()
-                opponent_stats = OpponentStats()
+                step_count = 0
                 while not state.is_terminal():
+                    step_count += 1
+                    if step_count > 1000:  # Тайм-аут
+                        logging.error(f"Tournament game {game_idx+1}/{num_games} vs {opp_type} exceeded 1000 steps, aborting")
+                        break
                     player_id = state.current_player()
                     bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
                     stacks = state.stacks() if hasattr(state, 'stacks') else [100] * config.NUM_PLAYERS
@@ -589,8 +598,16 @@ class Trainer:
                         probs = opp.action_probabilities(state, player_id)
                         action = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
                     state.apply_action(action)
+                    logging.debug(f"Tournament vs {opp_type}, game {game_idx+1}, step {step_count}: player {player_id} took action {action}")
                 total_reward[opp_type] += state.returns()[0]
-            logging.info(f"Avg reward vs {opp_type}: {total_reward[opp_type] / num_games:.4f}")
+            avg_reward = total_reward[opp_type] / num_games
+            logging.info(f"Avg reward vs {opp_type}: {avg_reward:.4f}")
+        
+        overall_avg_reward = sum(total_reward.values()) / (num_games * 3)
+        if overall_avg_reward > self.best_avg_reward:
+            self.best_avg_reward = overall_avg_reward
+            self.save_checkpoint(is_best=True)
+        return overall_avg_reward
 
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
@@ -654,16 +671,21 @@ class Trainer:
                 if time.time() - self.last_checkpoint_time >= config.CHECKPOINT_INTERVAL:
                     self.save_checkpoint()
 
-            if self.global_step % config.TEST_INTERVAL == 0:
+            pbar.update(1)
+            pbar.refresh()
+
+            if self.global_step % config.TEST_INTERVAL == 0 and self.global_step > 0:
+                logging.info(f"Running tournament at step {self.global_step}")
                 self.run_tournament()
 
-            pbar.update(1)
             if self.interrupted:
                 break
 
-        self.save_checkpoint()
         pbar.close()
-        logging.info("Training completed")
+        logging.info("Training completed, running final tournament")
+        final_avg_reward = self.run_tournament()
+        logging.info(f"Final average reward across all opponents: {final_avg_reward:.4f}")
+        self.save_checkpoint()
 
 # Запуск
 if __name__ == "__main__":
