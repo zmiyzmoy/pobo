@@ -448,6 +448,7 @@ class PokerAgent(policy.Policy):
         self.cumulative_strategies.clear()
         logging.info(f"Strategy pool updated, size: {len(self.strategy_pool)}")
 # Сбор опыта
+# Сбор опыта
 @ray.remote(num_cpus=1, num_gpus=0.5)
 def collect_experience(game, agent, processor, steps, worker_id):
     try:
@@ -504,6 +505,15 @@ def collect_experience(game, agent, processor, steps, worker_id):
     except Exception as e:
         logging.error(f"Worker {worker_id} failed: {str(e)}")
         raise
+# Обучение
+class Trainer:
+    def __init__(self, game, agent, processor):
+        self.game = game
+        self.agent = agent
+        self.processor = processor
+        self.buffer = PrioritizedReplayBuffer(config.BUFFER_CAPACITY)
+        self.global_step = 0
+        self.beta = 0.4
 
 # Обучение
 class Trainer:
@@ -520,13 +530,16 @@ class Trainer:
         for episode in range(config.NUM_EPISODES):
             logging.info(f"Starting episode {episode}")
             # Запускаем сбор опыта для всех воркеров
+            logging.debug(f"Launching {config.NUM_WORKERS} workers")
             futures = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i)
                        for i in range(config.NUM_WORKERS)]
+            logging.debug(f"Waiting for {len(futures)} futures")
             all_experiences = ray.get(futures)
             
             # Объединяем опыт от всех воркеров
             experiences = []
-            for worker_experiences in all_experiences:
+            for i, worker_experiences in enumerate(all_experiences):
+                logging.info(f"Worker {i} returned {len(worker_experiences)} experiences")
                 experiences.extend(worker_experiences)
             
             if experiences:
