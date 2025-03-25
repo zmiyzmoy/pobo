@@ -372,7 +372,10 @@ class PokerAgent(policy.Policy):
             stage[3] = 1
         state_tensor = torch.tensor(self.processor.process([state], [player_id], [bets], [stacks], [stage]), 
                                     dtype=torch.float32, device=device)
-
+    
+        # Переключаем модели в режим eval и отключаем градиенты
+        self.regret_net.eval()
+        self.strategy_net.eval()
         with torch.no_grad():
             regrets = self.regret_net(state_tensor)[0]
             strategy_logits = self.strategy_net(state_tensor)[0]
@@ -380,18 +383,21 @@ class PokerAgent(policy.Policy):
             legal_mask[legal_actions] = 1
             strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
             strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
-
+        # Возвращаем модели в режим train после предсказания
+        self.regret_net.train()
+        self.strategy_net.train()
+    
         state_key = state.information_state_string(player_id)
         if state_key not in self.cumulative_regrets:
             self.cumulative_regrets[state_key] = np.zeros(self.num_actions)
             self.cumulative_strategies[state_key] = np.zeros(self.num_actions)
         self.cumulative_regrets[state_key] += regrets.cpu().numpy()
         self.cumulative_strategies[state_key] += strategy
-
+    
         if len(self.cumulative_regrets) > config.MAX_DICT_SIZE:
             self.cumulative_regrets.pop(next(iter(self.cumulative_regrets)))
             self.cumulative_strategies.pop(next(iter(self.cumulative_strategies)))
-
+    
         positive_regrets = np.maximum(self.cumulative_regrets[state_key], 0)
         regret_sum = positive_regrets.sum()
         probs = positive_regrets / regret_sum if regret_sum > 0 else np.ones(self.num_actions) / len(legal_actions)
