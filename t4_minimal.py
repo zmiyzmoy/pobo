@@ -1,4 +1,4 @@
-#^remse
+#t4_minimal.py
 import os
 import time
 import logging
