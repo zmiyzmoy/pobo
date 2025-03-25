@@ -581,17 +581,16 @@ class Trainer:
         tag_agent = TightAggressiveAgent(self.game)
         lag_agent = LooseAggressiveAgent(self.game)
         opponent_stats = OpponentStats()
-
+    
         for opp_type, opp in [('self', self.agent), ('tight', tag_agent), ('loose', lag_agent)]:
             for game_idx in range(num_games):
                 state = self.game.new_initial_state()
-                step_count = 0
                 while not state.is_terminal():
-                    step_count += 1
-                    if step_count > 1000:  # Тайм-аут
-                        logging.error(f"Tournament game {game_idx+1}/{num_games} vs {opp_type} exceeded 1000 steps, aborting")
-                        break
                     player_id = state.current_player()
+                    if player_id < 0:  # Обработка шансных нод
+                        action = random.choice(state.legal_actions())
+                        state.apply_action(action)
+                        continue
                     bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
                     stacks = state.stacks() if hasattr(state, 'stacks') else [100] * config.NUM_PLAYERS
                     stage = [0] * 4
@@ -611,11 +610,11 @@ class Trainer:
                         probs = opp.action_probabilities(state, player_id)
                         action = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
                     state.apply_action(action)
-                    logging.debug(f"Tournament vs {opp_type}, game {game_idx+1}, step {step_count}: player {player_id} took action {action}")
                 total_reward[opp_type] += state.returns()[0]
+                logging.info(f"Game {game_idx+1}/{num_games} vs {opp_type} completed, reward: {state.returns()[0]}")
             avg_reward = total_reward[opp_type] / num_games
             logging.info(f"Avg reward vs {opp_type}: {avg_reward:.4f}")
-        
+    
         overall_avg_reward = sum(total_reward.values()) / (num_games * 3)
         if overall_avg_reward > self.best_avg_reward:
             self.best_avg_reward = overall_avg_reward
