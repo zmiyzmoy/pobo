@@ -506,6 +506,7 @@ def collect_experience(game, agent, processor, steps, worker_id):
         logging.error(f"Worker {worker_id} failed: {str(e)}")
         raise
 # Обучение
+# Обучение
 class Trainer:
     def __init__(self, game, agent, processor):
         self.game = game
@@ -514,36 +515,49 @@ class Trainer:
         self.buffer = PrioritizedReplayBuffer(config.BUFFER_CAPACITY)
         self.global_step = 0
         self.beta = 0.4
-        self.load_checkpoint()  # Загружаем чекпоинт при инициализации
+        self.load_checkpoint()
 
     def load_checkpoint(self):
-        if os.path.exists(config.MODEL_PATH):
-            checkpoint = torch.load(config.MODEL_PATH)
-            self.agent.regret_net.load_state_dict(checkpoint['regret_net'])
-            self.agent.strategy_net.load_state_dict(checkpoint['strategy_net'])
-            self.agent.optimizer.load_state_dict(checkpoint['optimizer'])
-            self.buffer.buffer = checkpoint['buffer']
-            self.buffer.priorities = checkpoint['priorities']
-            self.buffer._max_priority = checkpoint['max_priority']
-            self.global_step = checkpoint['global_step']
-            self.beta = checkpoint['beta']
-            logging.info(f"Loaded checkpoint from {config.MODEL_PATH} at step {self.global_step}")
+        checkpoint_path = config.MODEL_PATH
+        logging.debug(f"Checking for checkpoint at {checkpoint_path}")
+        if os.path.exists(checkpoint_path):
+            try:
+                checkpoint = torch.load(checkpoint_path)
+                self.agent.regret_net.load_state_dict(checkpoint['regret_net'])
+                self.agent.strategy_net.load_state_dict(checkpoint['strategy_net'])
+                self.agent.optimizer.load_state_dict(checkpoint['optimizer'])
+                self.buffer.buffer = checkpoint['buffer']
+                self.buffer.priorities = checkpoint['priorities']
+                self.buffer._max_priority = checkpoint['max_priority']
+                self.global_step = checkpoint['global_step']
+                self.beta = checkpoint['beta']
+                logging.info(f"Loaded checkpoint from {checkpoint_path} at step {self.global_step}")
+            except Exception as e:
+                logging.error(f"Failed to load checkpoint: {str(e)}")
         else:
-            logging.info("No checkpoint found, starting fresh")
+            logging.info(f"No checkpoint found at {checkpoint_path}, starting fresh")
 
     def save_checkpoint(self):
-        checkpoint = {
-            'regret_net': self.agent.regret_net.state_dict(),
-            'strategy_net': self.agent.strategy_net.state_dict(),
-            'optimizer': self.agent.optimizer.state_dict(),
-            'buffer': self.buffer.buffer,
-            'priorities': self.buffer.priorities,
-            'max_priority': self.buffer._max_priority,
-            'global_step': self.global_step,
-            'beta': self.beta
-        }
-        torch.save(checkpoint, config.MODEL_PATH)
-        logging.info(f"Saved checkpoint to {config.MODEL_PATH} at step {self.global_step}")
+        checkpoint_path = config.MODEL_PATH
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+            logging.debug(f"Created directory {checkpoint_dir}")
+        try:
+            checkpoint = {
+                'regret_net': self.agent.regret_net.state_dict(),
+                'strategy_net': self.agent.strategy_net.state_dict(),
+                'optimizer': self.agent.optimizer.state_dict(),
+                'buffer': self.buffer.buffer,
+                'priorities': self.buffer.priorities,
+                'max_priority': self.buffer._max_priority,
+                'global_step': self.global_step,
+                'beta': self.beta
+            }
+            torch.save(checkpoint, checkpoint_path)
+            logging.info(f"Saved checkpoint to {checkpoint_path} at step {self.global_step}")
+        except Exception as e:
+            logging.error(f"Failed to save checkpoint: {str(e)}")
 
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
@@ -603,7 +617,7 @@ class Trainer:
                     self.beta = min(1.0, self.beta + 0.001)
                 
                 self.agent.update_strategy_pool()
-                self.save_checkpoint()  # Сохраняем чекпоинт после каждого эпизода
+                self.save_checkpoint()
             
             pbar.update(1)
         pbar.close()
