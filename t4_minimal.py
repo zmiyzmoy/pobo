@@ -560,58 +560,63 @@ class Trainer:
             logging.error(f"Failed to save checkpoint: {str(e)}")
 
     def run_tournament(self):
-        logging.info(f"Starting tournament with {len(self.agent.strategy_pool)} strategies in pool")
-        if not self.agent.strategy_pool:
-            logging.info("Tournament skipped: strategy pool is empty")
-            return
-        total_reward = 0
-        num_games = 10
-        game_count = 0
-        opponent_stats = OpponentStats()  # Добавляем статистику для турнира
-        for opponent_strategy in self.agent.strategy_pool:
-            for _ in range(num_games // len(self.agent.strategy_pool)):
-                game_count += 1
-                logging.info(f"Playing tournament game {game_count}/{num_games}")
-                env = self.game.new_initial_state()
-                step_count = 0
-                while not env.is_terminal():
-                    step_count += 1
-                    if step_count > 1000:  # Тайм-аут на случай бесконечного цикла
-                        logging.error(f"Game {game_count} exceeded 1000 steps, aborting")
-                        break
-                    player_id = env.current_player()
-                    if player_id < 0:
-                        action = random.choice(env.legal_actions())
-                    else:
-                        bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
-                        stacks = env.stacks() if hasattr(env, 'stacks') else [100] * config.NUM_PLAYERS
-                        info_tensor = env.information_state_tensor(player_id)
-                        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-                        stage = [0] * 4
-                        if len(board_cards) == 0:
-                            stage[0] = 1
-                        elif len(board_cards) == 3:
-                            stage[1] = 1
-                        elif len(board_cards) == 4:
-                            stage[2] = 1
-                        elif len(board_cards) == 5:
-                            stage[3] = 1
-                        state_tensor = torch.tensor(self.processor.process([env], [player_id], [bets], [stacks], [stage], opponent_stats), 
-                                                  dtype=torch.float32, device=device)
-                        with torch.no_grad():
-                            self.agent.strategy_net.eval()
-                            logits = self.agent.strategy_net(state_tensor)[0]
-                            legal_mask = torch.zeros(config.NUM_ACTIONS, device=device)
-                            legal_mask[env.legal_actions()] = 1
-                            logits = logits.masked_fill(legal_mask == 0, -1e9)
-                            probs = torch.softmax(logits, dim=0).cpu().numpy()
-                            action = np.random.choice(list(range(config.NUM_ACTIONS)), p=probs)
-                        env.apply_action(action)
-                        logging.debug(f"Game {game_count}, step {step_count}: player {player_id} took action {action}")
-                total_reward += env.returns()[0]
-                logging.info(f"Game {game_count} completed, reward: {env.returns()[0]}")
-        avg_reward = total_reward / num_games
-        logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
+    logging.info(f"Starting tournament with {len(self.agent.strategy_pool)} strategies in pool")
+    if not self.agent.strategy_pool:
+        logging.info("Tournament skipped: strategy pool is empty")
+        return
+    total_reward = 0
+    num_games = 10
+    game_count = 0
+    opponent_stats = OpponentStats()
+    for opponent_strategy in self.agent.strategy_pool:
+        for _ in range(num_games // len(self.agent.strategy_pool)):
+            game_count += 1
+            logging.info(f"Playing tournament game {game_count}/{num_games}")
+            env = self.game.new_initial_state()
+            step_count = 0
+            while not env.is_terminal():
+                step_count += 1
+                if step_count > 1000:
+                    logging.error(f"Game {game_count} exceeded 1000 steps, aborting. Last state: {env.information_state_string(0)}")
+                    break
+                player_id = env.current_player()
+                legal_actions = env.legal_actions()
+                if not legal_actions:
+                    logging.warning(f"Game {game_count}, step {step_count}: No legal actions for player {player_id}")
+                    break
+                if player_id < 0:
+                    action = random.choice(legal_actions)
+                    logging.debug(f"Game {game_count}, step {step_count}: Chance node, action={action}")
+                else:
+                    bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
+                    stacks = env.stacks() if hasattr(env, 'stacks') else [100] * config.NUM_PLAYERS
+                    info_tensor = env.information_state_tensor(player_id)
+                    board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+                    stage = [0] * 4
+                    if len(board_cards) == 0:
+                        stage[0] = 1
+                    elif len(board_cards) == 3:
+                        stage[1] = 1
+                    elif len(board_cards) == 4:
+                        stage[2] = 1
+                    elif len(board_cards) == 5:
+                        stage[3] = 1
+                    state_tensor = torch.tensor(self.processor.process([env], [player_id], [bets], [stacks], [stage], opponent_stats),
+                                              dtype=torch.float32, device=device)
+                    with torch.no_grad():
+                        self.agent.strategy_net.eval()
+                        logits = self.agent.strategy_net(state_tensor)[0]
+                        legal_mask = torch.zeros(self.agent.num_actions, device=device)
+                        legal_mask[legal_actions] = 1
+                        logits = logits.masked_fill(legal_mask == 0, -1e9)
+                        probs = torch.softmax(logits, dim=0).cpu().numpy()
+                        action = np.random.choice(legal_actions, p=probs[legal_actions] / probs[legal_actions].sum())
+                    logging.debug(f"Game {game_count}, step {step_count}: player {player_id}, legal_actions={legal_actions}, action={action}, probs={probs[legal_actions]}")
+                env.apply_action(action)
+            total_reward += env.returns()[0]
+            logging.info(f"Game {game_count} completed, reward: {env.returns()[0]}")
+    avg_reward = total_reward / num_games
+    logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
 
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
