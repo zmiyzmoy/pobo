@@ -559,8 +559,8 @@ class Trainer:
         except Exception as e:
             logging.error(f"Failed to save checkpoint: {str(e)}")
 
-        def run_tournament(self):
-        logging.debug(f"Starting tournament, strategy pool size: {len(self.agent.strategy_pool)}")
+    def run_tournament(self):
+        logging.info(f"Starting tournament with {len(self.agent.strategy_pool)} strategies in pool")
         if not self.agent.strategy_pool:
             logging.info("Tournament skipped: strategy pool is empty")
             return
@@ -570,7 +570,7 @@ class Trainer:
         for opponent_strategy in self.agent.strategy_pool:
             for _ in range(num_games // len(self.agent.strategy_pool)):
                 game_count += 1
-                logging.debug(f"Running tournament game {game_count}/{num_games}")
+                logging.info(f"Playing tournament game {game_count}/{num_games}")
                 env = self.game.new_initial_state()
                 while not env.is_terminal():
                     player_id = env.current_player()
@@ -602,6 +602,7 @@ class Trainer:
                             action = np.random.choice(list(range(config.NUM_ACTIONS)), p=probs)
                         env.apply_action(action)
                 total_reward += env.returns()[0]
+                logging.debug(f"Game {game_count} completed, reward: {env.returns()[0]}")
         avg_reward = total_reward / num_games
         logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
 
@@ -667,6 +668,7 @@ class Trainer:
                 self.run_tournament()
             
             pbar.update(1)
+            pbar.refresh()  # Принудительно обновляем прогресс-бар
         pbar.close()
 # Запуск
 if __name__ == "__main__":
