@@ -559,15 +559,18 @@ class Trainer:
         except Exception as e:
             logging.error(f"Failed to save checkpoint: {str(e)}")
 
-    def run_tournament(self):
+        def run_tournament(self):
         logging.debug(f"Starting tournament, strategy pool size: {len(self.agent.strategy_pool)}")
         if not self.agent.strategy_pool:
             logging.info("Tournament skipped: strategy pool is empty")
             return
         total_reward = 0
         num_games = 10
+        game_count = 0
         for opponent_strategy in self.agent.strategy_pool:
             for _ in range(num_games // len(self.agent.strategy_pool)):
+                game_count += 1
+                logging.debug(f"Running tournament game {game_count}/{num_games}")
                 env = self.game.new_initial_state()
                 while not env.is_terminal():
                     player_id = env.current_player()
