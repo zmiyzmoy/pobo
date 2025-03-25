@@ -507,9 +507,15 @@ class TightAggressiveAgent(policy.Policy):
         if strength > 0.5 and 3 in legal_actions:
             probs[3] = 0.8
             probs[1] = 0.2
-        else:
-            probs[0] = 0.7
+        elif 1 in legal_actions:
             probs[1] = 0.3
+            probs[0] = 0.7
+        else:
+            probs[0] = 1.0
+        total = sum(probs.values())
+        if total <= 0:  # Гарантируем ненулевую сумму
+            probs = {a: 1.0 / len(legal_actions) for a in legal_actions}
+            logging.warning(f"TightAggressiveAgent: Zero probability sum, using uniform distribution over {legal_actions}")
         return probs
 
 class LooseAggressiveAgent(policy.Policy):
@@ -524,9 +530,15 @@ class LooseAggressiveAgent(policy.Policy):
         if 3 in legal_actions:
             probs[3] = 0.7
             probs[1] = 0.3
-        else:
+        elif 1 in legal_actions:
             probs[1] = 0.6
             probs[0] = 0.4
+        else:
+            probs[0] = 1.0
+        total = sum(probs.values())
+        if total <= 0:  # Гарантируем ненулевую сумму
+            probs = {a: 1.0 / len(legal_actions) for a in legal_actions}
+            logging.warning(f"LooseAggressiveAgent: Zero probability sum, using uniform distribution over {legal_actions}")
         return probs
 
 # Обучение
@@ -576,7 +588,7 @@ class Trainer:
         logging.info(f"Saved checkpoint to {config.MODEL_PATH} at step {self.global_step}")
 
     def run_tournament(self):
-        num_games = 20  # Уменьшено для скорости
+        num_games = 20
         total_reward = {'self': 0, 'tight': 0, 'loose': 0}
         tag_agent = TightAggressiveAgent(self.game)
         lag_agent = LooseAggressiveAgent(self.game)
@@ -609,6 +621,11 @@ class Trainer:
                     else:
                         probs = opp.action_probabilities(state, player_id)
                         action = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
+                    # Проверка валидности действия
+                    legal_actions = state.legal_actions(player_id)
+                    if action not in legal_actions:
+                        logging.error(f"Invalid action {action} chosen, legal actions: {legal_actions}")
+                        action = random.choice(legal_actions)  # Fallback на случайное легальное действие
                     state.apply_action(action)
                 total_reward[opp_type] += state.returns()[0]
                 logging.info(f"Game {game_idx+1}/{num_games} vs {opp_type} completed, reward: {state.returns()[0]}")
@@ -620,7 +637,6 @@ class Trainer:
             self.best_avg_reward = overall_avg_reward
             self.save_checkpoint(is_best=True)
         return overall_avg_reward
-
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
 
