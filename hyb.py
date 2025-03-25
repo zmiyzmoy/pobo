@@ -38,14 +38,14 @@ class Config:
         self.LOG_DIR = os.path.join(self.BASE_DIR, 'logs')
         self.KMEANS_PATH = os.path.join(self.BASE_DIR, 'models', 'kmeans.joblib')
         self.NUM_EPISODES = args.num_episodes
-        self.BATCH_SIZE = 64
+        self.BATCH_SIZE = 128
         self.GAMMA = 0.96
         self.BUFFER_CAPACITY = 10000
         self.NUM_WORKERS = args.num_workers
-        self.STEPS_PER_WORKER = 500
+        self.STEPS_PER_WORKER = 1500
         self.SELFPLAY_UPDATE_FREQ = 50
         self.LOG_FREQ = 10
-        self.TEST_INTERVAL = 50
+        self.TEST_INTERVAL = 5
         self.LEARNING_RATE = 1e-4
         self.NUM_PLAYERS = 6
         self.GRAD_CLIP_VALUE = 5.0
@@ -603,16 +603,16 @@ class Trainer:
 
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
-
+    
         def signal_handler(sig, frame):
             self.interrupted = True
             self.save_checkpoint()
             ray.shutdown()
             sys.exit(0)
-
+    
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-
+    
         for episode in range(config.NUM_EPISODES):
             logging.info(f"Starting episode {episode}")
             futures = [collect_experience.remote(self.game, self.agent, self.processor, config.STEPS_PER_WORKER, i)
@@ -621,7 +621,8 @@ class Trainer:
             experiences = []
             for worker_experiences in all_experiences:
                 experiences.extend(worker_experiences)
-
+            logging.info(f"Collected {len(experiences)} experiences in episode {episode}")
+    
             if experiences:
                 normalized_experiences = []
                 for exp in experiences:
@@ -630,17 +631,18 @@ class Trainer:
                     normalized_reward = self.reward_normalizer.normalize(reward, stacks[player_id])
                     normalized_experiences.append((state, player_id, action, normalized_reward, next_state, done, bets, stacks, stage))
                 self.buffer.add_batch(normalized_experiences)
-
+    
                 if len(self.buffer) >= config.BATCH_SIZE:
+                    logging.info(f"Buffer size before sampling: {len(self.buffer)}")
                     batch, indices, weights = self.buffer.sample(config.BATCH_SIZE, self.beta)
                     states, player_ids, actions, rewards, next_states, dones, bets, stacks, stages = zip(*batch)
                     states = torch.tensor(self.processor.process(states, player_ids, bets, stacks, stages), 
-                                        dtype=torch.float32, device=device)
+                                         dtype=torch.float32, device=device)
                     actions = torch.tensor(actions, dtype=torch.long, device=device)
                     rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
                     next_states = torch.tensor(self.processor.process(next_states, player_ids, bets, stacks, stages), 
-                                             dtype=torch.float32, device=device)
-
+                                              dtype=torch.float32, device=device)
+    
                     self.agent.optimizer.zero_grad()
                     with autocast():
                         q_values = self.agent.regret_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
@@ -652,7 +654,7 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(list(self.agent.regret_net.parameters()) + list(self.agent.strategy_net.parameters()), config.GRAD_CLIP_VALUE)
                     scaler.step(self.agent.optimizer)
                     scaler.update()
-
+    
                     td_errors = (q_values - targets).abs().detach().cpu().numpy()
                     self.buffer.update_priorities(indices, td_errors + 1e-5)
                     self.global_step += 1
@@ -660,13 +662,13 @@ class Trainer:
                     writer.add_scalar('Loss', loss.item(), self.global_step)
                     logging.info(f"Step {self.global_step} | Loss: {loss.item():.4f}")
                     self.beta = min(1.0, self.beta + 0.001)
-
+    
                 self.agent.update_strategy_pool()
                 if time.time() - self.last_checkpoint_time >= config.CHECKPOINT_INTERVAL:
                     self.save_checkpoint()
-
+    
             pbar.update(1)
-
+    
             if self.global_step % config.TEST_INTERVAL == 0 and self.global_step > 0:
                 avg_reward = run_tournament(self.game, self.agent, self.processor)
                 writer.add_scalar('Tournament/Reward', avg_reward, self.global_step)
@@ -674,13 +676,13 @@ class Trainer:
                     self.best_avg_reward = avg_reward
                     self.save_checkpoint(is_best=True)
                 self.agent.update_strategy_pool(avg_reward)
-
+    
             gc.collect()
             torch.cuda.empty_cache()
-
+    
             if self.interrupted:
                 break
-
+    
         pbar.close()
         logging.info("Training completed")
         self.save_checkpoint()
