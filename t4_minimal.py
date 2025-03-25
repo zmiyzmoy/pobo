@@ -506,6 +506,7 @@ def collect_experience(game, agent, processor, steps, worker_id):
         logging.error(f"Worker {worker_id} failed: {str(e)}")
         raise
 # Обучение
+# Обучение
 class Trainer:
     def __init__(self, game, agent, processor):
         self.game = game
@@ -559,11 +560,12 @@ class Trainer:
             logging.error(f"Failed to save checkpoint: {str(e)}")
 
     def run_tournament(self):
+        logging.debug(f"Starting tournament, strategy pool size: {len(self.agent.strategy_pool)}")
         if not self.agent.strategy_pool:
             logging.info("Tournament skipped: strategy pool is empty")
             return
         total_reward = 0
-        num_games = 10  # Количество игр в турнире
+        num_games = 10
         for opponent_strategy in self.agent.strategy_pool:
             for _ in range(num_games // len(self.agent.strategy_pool)):
                 env = self.game.new_initial_state()
@@ -596,7 +598,7 @@ class Trainer:
                             probs = torch.softmax(logits, dim=0).cpu().numpy()
                             action = np.random.choice(list(range(config.NUM_ACTIONS)), p=probs)
                         env.apply_action(action)
-                total_reward += env.returns()[0]  # Награда для игрока 0
+                total_reward += env.returns()[0]
         avg_reward = total_reward / num_games
         logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
 
@@ -659,7 +661,7 @@ class Trainer:
                 
                 self.agent.update_strategy_pool()
                 self.save_checkpoint()
-                self.run_tournament()  # Добавляем турнир после каждого эпизода
+                self.run_tournament()
             
             pbar.update(1)
         pbar.close()
