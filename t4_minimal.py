@@ -1,4 +1,3 @@
-#t4_minimal.py -2
 import os
 import time
 import logging
@@ -28,6 +27,27 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+
+# Класс нормализации наград
+class RewardNormalizer:
+    def __init__(self):
+        self.mean = 0.0
+        self.std = 1.0
+        self.count = 0
+        self.m2 = 0.0
+
+    def update(self, reward):
+        self.count += 1
+        delta = reward - self.mean
+        self.mean += delta / self.count
+        delta2 = reward - self.mean
+        self.m2 += delta * delta2
+        if self.count > 1:
+            self.std = (self.m2 / (self.count - 1)) ** 0.5
+        self.std = max(self.std, 1e-6)
+
+    def normalize(self, reward):
+        return (reward - self.mean) / self.std if self.std > 1e-6 else reward
 
 # Конфигурация
 class Config:
@@ -245,7 +265,6 @@ class OpponentStats:
         }
 
 # Обработка состояний
-# Обработка состояний
 class StateProcessor:
     def __init__(self):
         self.card_embedding = CardEmbedding()
@@ -447,7 +466,7 @@ class PokerAgent(policy.Policy):
         self.strategy_pool.append(strategy_dict)
         self.cumulative_strategies.clear()
         logging.info(f"Strategy pool updated, size: {len(self.strategy_pool)}")
-# Сбор опыта
+
 # Сбор опыта
 @ray.remote(num_cpus=1, num_gpus=0.5)
 def collect_experience(game, agent, processor, steps, worker_id):
@@ -505,7 +524,7 @@ def collect_experience(game, agent, processor, steps, worker_id):
     except Exception as e:
         logging.error(f"Worker {worker_id} failed: {str(e)}")
         raise
-# Обучение
+
 # Обучение
 class Trainer:
     def __init__(self, game, agent, processor):
@@ -542,91 +561,92 @@ class Trainer:
                 logging.error(f"Failed to load checkpoint: {str(e)}")
         else:
             logging.info(f"No checkpoint found at {checkpoint_path}, starting fresh")
-    
-        def save_checkpoint(self):
-            checkpoint_path = config.MODEL_PATH
-            checkpoint_dir = os.path.dirname(checkpoint_path)
-            if not os.path.exists(checkpoint_dir):
-                os.makedirs(checkpoint_dir)
-                logging.debug(f"Created directory {checkpoint_dir}")
-            try:
-                checkpoint = {
-                    'regret_net': self.agent.regret_net.state_dict(),
-                    'strategy_net': self.agent.strategy_net.state_dict(),
-                    'optimizer': self.agent.optimizer.state_dict(),
-                    'buffer': self.buffer.buffer,
-                    'priorities': self.buffer.priorities,
-                    'max_priority': self.buffer._max_priority,
-                    'global_step': self.global_step,
-                    'beta': self.beta,
-                    # Сохраняем состояние нормализатора
-                    'reward_mean': self.reward_normalizer.mean,
-                    'reward_std': self.reward_normalizer.std,
-                    'reward_count': self.reward_normalizer.count,
-                    'reward_m2': self.reward_normalizer.m2
-                }
-                torch.save(checkpoint, checkpoint_path)
-                logging.info(f"Saved checkpoint to {checkpoint_path} at step {self.global_step}")
-            except Exception as e:
-                logging.error(f"Failed to save checkpoint: {str(e)}")
-        def run_tournament(self):
-            logging.info(f"Starting tournament with {len(self.agent.strategy_pool)} strategies in pool")
-            if not self.agent.strategy_pool:
-                logging.info("Tournament skipped: strategy pool is empty")
-                return
-            total_reward = 0
-            num_games = 10
-            game_count = 0
-            opponent_stats = OpponentStats()
-            for opponent_strategy in self.agent.strategy_pool:
-                for _ in range(num_games // len(self.agent.strategy_pool)):
-                    game_count += 1
-                    logging.info(f"Playing tournament game {game_count}/{num_games}")
-                    env = self.game.new_initial_state()
-                    step_count = 0
-                    while not env.is_terminal():
-                        step_count += 1
-                        if step_count > 1000:
-                            logging.error(f"Game {game_count} exceeded 1000 steps, aborting. Last state: {env.information_state_string(0)}")
-                            break
-                        player_id = env.current_player()
-                        legal_actions = env.legal_actions()
-                        if not legal_actions:
-                            logging.warning(f"Game {game_count}, step {step_count}: No legal actions for player {player_id}")
-                            break
-                        if player_id < 0:
-                            action = random.choice(legal_actions)
-                            logging.debug(f"Game {game_count}, step {step_count}: Chance node, action={action}")
-                        else:
-                            bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
-                            stacks = env.stacks() if hasattr(env, 'stacks') else [100] * config.NUM_PLAYERS
-                            info_tensor = env.information_state_tensor(player_id)
-                            board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
-                            stage = [0] * 4
-                            if len(board_cards) == 0:
-                                stage[0] = 1
-                            elif len(board_cards) == 3:
-                                stage[1] = 1
-                            elif len(board_cards) == 4:
-                                stage[2] = 1
-                            elif len(board_cards) == 5:
-                                stage[3] = 1
-                            state_tensor = torch.tensor(self.processor.process([env], [player_id], [bets], [stacks], [stage], opponent_stats),
-                                                      dtype=torch.float32, device=device)
-                            with torch.no_grad():
-                                self.agent.strategy_net.eval()
-                                logits = self.agent.strategy_net(state_tensor)[0]
-                                legal_mask = torch.zeros(self.agent.num_actions, device=device)
-                                legal_mask[legal_actions] = 1
-                                logits = logits.masked_fill(legal_mask == 0, -1e9)
-                                probs = torch.softmax(logits, dim=0).cpu().numpy()
-                                action = np.random.choice(legal_actions, p=probs[legal_actions] / probs[legal_actions].sum())
-                            logging.debug(f"Game {game_count}, step {step_count}: player {player_id}, legal_actions={legal_actions}, action={action}, probs={probs[legal_actions]}")
-                        env.apply_action(action)
-                    total_reward += env.returns()[0]
-                    logging.info(f"Game {game_count} completed, reward: {env.returns()[0]}")
-            avg_reward = total_reward / num_games
-            logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
+
+    def save_checkpoint(self):
+        checkpoint_path = config.MODEL_PATH
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+            logging.debug(f"Created directory {checkpoint_dir}")
+        try:
+            checkpoint = {
+                'regret_net': self.agent.regret_net.state_dict(),
+                'strategy_net': self.agent.strategy_net.state_dict(),
+                'optimizer': self.agent.optimizer.state_dict(),
+                'buffer': self.buffer.buffer,
+                'priorities': self.buffer.priorities,
+                'max_priority': self.buffer._max_priority,
+                'global_step': self.global_step,
+                'beta': self.beta,
+                # Сохраняем состояние нормализатора
+                'reward_mean': self.reward_normalizer.mean,
+                'reward_std': self.reward_normalizer.std,
+                'reward_count': self.reward_normalizer.count,
+                'reward_m2': self.reward_normalizer.m2
+            }
+            torch.save(checkpoint, checkpoint_path)
+            logging.info(f"Saved checkpoint to {checkpoint_path} at step {self.global_step}")
+        except Exception as e:
+            logging.error(f"Failed to save checkpoint: {str(e)}")
+
+    def run_tournament(self):
+        logging.info(f"Starting tournament with {len(self.agent.strategy_pool)} strategies in pool")
+        if not self.agent.strategy_pool:
+            logging.info("Tournament skipped: strategy pool is empty")
+            return
+        total_reward = 0
+        num_games = 10
+        game_count = 0
+        opponent_stats = OpponentStats()
+        for opponent_strategy in self.agent.strategy_pool:
+            for _ in range(num_games // len(self.agent.strategy_pool)):
+                game_count += 1
+                logging.info(f"Playing tournament game {game_count}/{num_games}")
+                env = self.game.new_initial_state()
+                step_count = 0
+                while not env.is_terminal():
+                    step_count += 1
+                    if step_count > 1000:
+                        logging.error(f"Game {game_count} exceeded 1000 steps, aborting. Last state: {env.information_state_string(0)}")
+                        break
+                    player_id = env.current_player()
+                    legal_actions = env.legal_actions()
+                    if not legal_actions:
+                        logging.warning(f"Game {game_count}, step {step_count}: No legal actions for player {player_id}")
+                        break
+                    if player_id < 0:
+                        action = random.choice(legal_actions)
+                        logging.debug(f"Game {game_count}, step {step_count}: Chance node, action={action}")
+                    else:
+                        bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
+                        stacks = env.stacks() if hasattr(env, 'stacks') else [100] * config.NUM_PLAYERS
+                        info_tensor = env.information_state_tensor(player_id)
+                        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+                        stage = [0] * 4
+                        if len(board_cards) == 0:
+                            stage[0] = 1
+                        elif len(board_cards) == 3:
+                            stage[1] = 1
+                        elif len(board_cards) == 4:
+                            stage[2] = 1
+                        elif len(board_cards) == 5:
+                            stage[3] = 1
+                        state_tensor = torch.tensor(self.processor.process([env], [player_id], [bets], [stacks], [stage], opponent_stats),
+                                                  dtype=torch.float32, device=device)
+                        with torch.no_grad():
+                            self.agent.strategy_net.eval()
+                            logits = self.agent.strategy_net(state_tensor)[0]
+                            legal_mask = torch.zeros(self.agent.num_actions, device=device)
+                            legal_mask[legal_actions] = 1
+                            logits = logits.masked_fill(legal_mask == 0, -1e9)
+                            probs = torch.softmax(logits, dim=0).cpu().numpy()
+                            action = np.random.choice(legal_actions, p=probs[legal_actions] / probs[legal_actions].sum())
+                        logging.debug(f"Game {game_count}, step {step_count}: player {player_id}, legal_actions={legal_actions}, action={action}, probs={probs[legal_actions]}")
+                    env.apply_action(action)
+                total_reward += env.returns()[0]
+                logging.info(f"Game {game_count} completed, reward: {env.returns()[0]}")
+        avg_reward = total_reward / num_games
+        logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
 
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
@@ -650,6 +670,7 @@ class Trainer:
                     reward = exp[3]  # Предполагаем, что reward — это 4-й элемент кортежа
                     self.reward_normalizer.update(reward)
                     normalized_reward = self.reward_normalizer.normalize(reward)
+                    logging.debug(f"Raw reward: {reward}, Normalized reward: {normalized_reward}")
                     normalized_exp = (exp[0], exp[1], exp[2], normalized_reward, exp[4], exp[5], exp[6], exp[7], exp[8])
                     normalized_experiences.append(normalized_exp)
                 
@@ -659,8 +680,6 @@ class Trainer:
                 if len(self.buffer) >= config.BATCH_SIZE:
                     batch, indices, weights = self.buffer.sample(config.BATCH_SIZE, self.beta)
                     states, player_ids, actions, rewards, next_states, dones, bets, stacks, stages = zip(*batch)
-                    # Дальше код остаётся без изменений
-                    # ...
                     
                     opponent_stats = OpponentStats()
                     for exp in experiences:
@@ -704,6 +723,7 @@ class Trainer:
         pbar.close()
         logging.info("Training completed, starting tournament phase")
         self.run_tournament()
+
 # Запуск
 if __name__ == "__main__":
     mp.set_start_method('spawn')
