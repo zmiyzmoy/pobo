@@ -409,7 +409,12 @@ class PokerAgent(policy.Policy):
         if action > 1:
             state_tensor = torch.tensor(self.processor.process([state], [player_id], [bets], [stacks], [stage]), 
                                         dtype=torch.float32, device=device)
-            q_value = self.strategy_net(state_tensor).max().item()
+            # Переключаем модель в режим eval и отключаем градиенты
+            self.strategy_net.eval()
+            with torch.no_grad():
+                q_value = self.strategy_net(state_tensor).max().item()
+            # Возвращаем модель в режим train после предсказания
+            self.strategy_net.train()
             bet_size = self._dynamic_bet_size(state, stacks, bets, player_id, q_value, stage)
             if bet_size >= stacks[player_id] and 3 in state.legal_actions(player_id):
                 action = 3
