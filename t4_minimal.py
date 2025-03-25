@@ -506,7 +506,6 @@ def collect_experience(game, agent, processor, steps, worker_id):
         logging.error(f"Worker {worker_id} failed: {str(e)}")
         raise
 # Обучение
-# Обучение
 class Trainer:
     def __init__(self, game, agent, processor):
         self.game = game
@@ -558,6 +557,48 @@ class Trainer:
             logging.info(f"Saved checkpoint to {checkpoint_path} at step {self.global_step}")
         except Exception as e:
             logging.error(f"Failed to save checkpoint: {str(e)}")
+
+    def run_tournament(self):
+        if not self.agent.strategy_pool:
+            logging.info("Tournament skipped: strategy pool is empty")
+            return
+        total_reward = 0
+        num_games = 10  # Количество игр в турнире
+        for opponent_strategy in self.agent.strategy_pool:
+            for _ in range(num_games // len(self.agent.strategy_pool)):
+                env = self.game.new_initial_state()
+                while not env.is_terminal():
+                    player_id = env.current_player()
+                    if player_id < 0:
+                        action = random.choice(env.legal_actions())
+                    else:
+                        bets = env.bets() if hasattr(env, 'bets') else [0] * config.NUM_PLAYERS
+                        stacks = env.stacks() if hasattr(env, 'stacks') else [100] * config.NUM_PLAYERS
+                        info_tensor = env.information_state_tensor(player_id)
+                        board_cards = [int(c) for i, c in enumerate(info_tensor[52:]) if c >= 0]
+                        stage = [0] * 4
+                        if len(board_cards) == 0:
+                            stage[0] = 1
+                        elif len(board_cards) == 3:
+                            stage[1] = 1
+                        elif len(board_cards) == 4:
+                            stage[2] = 1
+                        elif len(board_cards) == 5:
+                            stage[3] = 1
+                        state_tensor = torch.tensor(self.processor.process([env], [player_id], [bets], [stacks], [stage]), 
+                                                  dtype=torch.float32, device=device)
+                        with torch.no_grad():
+                            self.agent.strategy_net.eval()
+                            logits = self.agent.strategy_net(state_tensor)[0]
+                            legal_mask = torch.zeros(config.NUM_ACTIONS, device=device)
+                            legal_mask[env.legal_actions()] = 1
+                            logits = logits.masked_fill(legal_mask == 0, -1e9)
+                            probs = torch.softmax(logits, dim=0).cpu().numpy()
+                            action = np.random.choice(list(range(config.NUM_ACTIONS)), p=probs)
+                        env.apply_action(action)
+                total_reward += env.returns()[0]  # Награда для игрока 0
+        avg_reward = total_reward / num_games
+        logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
 
     def train(self):
         pbar = tqdm(total=config.NUM_EPISODES, desc="Training")
@@ -618,6 +659,7 @@ class Trainer:
                 
                 self.agent.update_strategy_pool()
                 self.save_checkpoint()
+                self.run_tournament()  # Добавляем турнир после каждого эпизода
             
             pbar.update(1)
         pbar.close()
