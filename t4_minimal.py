@@ -567,12 +567,18 @@ class Trainer:
         total_reward = 0
         num_games = 10
         game_count = 0
+        opponent_stats = OpponentStats()  # Добавляем статистику для турнира
         for opponent_strategy in self.agent.strategy_pool:
             for _ in range(num_games // len(self.agent.strategy_pool)):
                 game_count += 1
                 logging.info(f"Playing tournament game {game_count}/{num_games}")
                 env = self.game.new_initial_state()
+                step_count = 0
                 while not env.is_terminal():
+                    step_count += 1
+                    if step_count > 1000:  # Тайм-аут на случай бесконечного цикла
+                        logging.error(f"Game {game_count} exceeded 1000 steps, aborting")
+                        break
                     player_id = env.current_player()
                     if player_id < 0:
                         action = random.choice(env.legal_actions())
@@ -590,7 +596,7 @@ class Trainer:
                             stage[2] = 1
                         elif len(board_cards) == 5:
                             stage[3] = 1
-                        state_tensor = torch.tensor(self.processor.process([env], [player_id], [bets], [stacks], [stage]), 
+                        state_tensor = torch.tensor(self.processor.process([env], [player_id], [bets], [stacks], [stage], opponent_stats), 
                                                   dtype=torch.float32, device=device)
                         with torch.no_grad():
                             self.agent.strategy_net.eval()
@@ -601,8 +607,9 @@ class Trainer:
                             probs = torch.softmax(logits, dim=0).cpu().numpy()
                             action = np.random.choice(list(range(config.NUM_ACTIONS)), p=probs)
                         env.apply_action(action)
+                        logging.debug(f"Game {game_count}, step {step_count}: player {player_id} took action {action}")
                 total_reward += env.returns()[0]
-                logging.debug(f"Game {game_count} completed, reward: {env.returns()[0]}")
+                logging.info(f"Game {game_count} completed, reward: {env.returns()[0]}")
         avg_reward = total_reward / num_games
         logging.info(f"Tournament completed: average reward = {avg_reward:.4f}")
 
@@ -665,11 +672,12 @@ class Trainer:
                 
                 self.agent.update_strategy_pool()
                 self.save_checkpoint()
-                self.run_tournament()
             
             pbar.update(1)
-            pbar.refresh()  # Принудительно обновляем прогресс-бар
+            pbar.refresh()
         pbar.close()
+        logging.info("Training completed, starting tournament phase")
+        self.run_tournament()
 # Запуск
 if __name__ == "__main__":
     mp.set_start_method('spawn')
