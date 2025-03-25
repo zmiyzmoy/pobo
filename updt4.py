@@ -381,7 +381,8 @@ class PokerAgent(policy.Policy):
             strategy_logits = self.strategy_net(state_tensor)[0]
             legal_mask = torch.zeros(self.num_actions, device=device)
             legal_mask[legal_actions] = 1
-            strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e9)
+            # Заменяем -1e9 на -1e4, чтобы избежать переполнения в FP16
+            strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e4)
             strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
         # Возвращаем модели в режим train после предсказания
         self.regret_net.train()
@@ -402,7 +403,6 @@ class PokerAgent(policy.Policy):
         regret_sum = positive_regrets.sum()
         probs = positive_regrets / regret_sum if regret_sum > 0 else np.ones(self.num_actions) / len(legal_actions)
         return {a: float(probs[a]) if a in legal_actions else 0.0 for a in range(self.num_actions)}
-
     def step(self, state, player_id: int, bets: List[float], stacks: List[float], stage: List[int], opponent_stats: OpponentStats) -> int:
         probs = self.action_probabilities(state, player_id, opponent_stats)
         action = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
