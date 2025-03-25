@@ -356,7 +356,7 @@ class PokerAgent(policy.Policy):
             return 0.0
         pot = sum(bets)
         my_stack = stacks[player_id]
-        min_raise = pot * 0.1  # Примерное значение
+        min_raise = pot * 0.1
         max_raise = my_stack
         base = min_raise + (max_raise - min_raise) * q_value
         return min(max(base, min_raise), max_raise)
@@ -365,6 +365,7 @@ class PokerAgent(policy.Policy):
         legal_actions = state.legal_actions(player_id)
         if not legal_actions:
             return {0: 1.0}
+
         bets = state.bets() if hasattr(state, 'bets') else [0] * config.NUM_PLAYERS
         stacks = state.stacks() if hasattr(state, 'stacks') else [100] * config.NUM_PLAYERS
         stage = [0] * 4
@@ -380,8 +381,7 @@ class PokerAgent(policy.Policy):
             stage[3] = 1
         state_tensor = torch.tensor(self.processor.process([state], [player_id], [bets], [stacks], [stage]), 
                                     dtype=torch.float32, device=device)
-    
-        # Переключаем модели в режим eval и отключаем градиенты
+
         self.regret_net.eval()
         self.strategy_net.eval()
         with torch.no_grad():
@@ -389,39 +389,53 @@ class PokerAgent(policy.Policy):
             strategy_logits = self.strategy_net(state_tensor)[0]
             legal_mask = torch.zeros(self.num_actions, device=device)
             legal_mask[legal_actions] = 1
-            # Заменяем -1e9 на -1e4, чтобы избежать переполнения в FP16
             strategy_logits = strategy_logits.masked_fill(legal_mask == 0, -1e4)
             strategy = torch.softmax(strategy_logits, dim=0).cpu().numpy()
-        # Возвращаем модели в режим train после предсказания
+
         self.regret_net.train()
         self.strategy_net.train()
-    
+
         state_key = state.information_state_string(player_id)
         if state_key not in self.cumulative_regrets:
             self.cumulative_regrets[state_key] = np.zeros(self.num_actions)
             self.cumulative_strategies[state_key] = np.zeros(self.num_actions)
         self.cumulative_regrets[state_key] += regrets.cpu().numpy()
         self.cumulative_strategies[state_key] += strategy
-    
+
         if len(self.cumulative_regrets) > config.MAX_DICT_SIZE:
             self.cumulative_regrets.pop(next(iter(self.cumulative_regrets)))
             self.cumulative_strategies.pop(next(iter(self.cumulative_strategies)))
-    
+
         positive_regrets = np.maximum(self.cumulative_regrets[state_key], 0)
         regret_sum = positive_regrets.sum()
-        probs = positive_regrets / regret_sum if regret_sum > 0 else np.ones(self.num_actions) / len(legal_actions)
-        return {a: float(probs[a]) if a in legal_actions else 0.0 for a in range(self.num_actions)}
+        if regret_sum > 0:
+            probs = positive_regrets / regret_sum
+        else:
+            probs = np.ones(self.num_actions) / len(legal_actions)
+
+        # Фильтруем только легальные действия и гарантируем ненулевую сумму
+        legal_probs = {a: float(probs[a]) if a in legal_actions else 0.0 for a in range(self.num_actions)}
+        total_prob = sum(legal_probs.values())
+        if total_prob <= 0:  # Если сумма всё ещё 0, распределяем равномерно по легальным действиям
+            legal_probs = {a: 1.0 / len(legal_actions) if a in legal_actions else 0.0 for a in range(self.num_actions)}
+            logging.warning(f"Zero total probability detected for state {state_key}, using uniform distribution over legal actions")
+        
+        return legal_probs
+
     def step(self, state, player_id: int, bets: List[float], stacks: List[float], stage: List[int], opponent_stats: OpponentStats) -> int:
         probs = self.action_probabilities(state, player_id, opponent_stats)
-        action = random.choices(list(probs.keys()), weights=list(probs.values()), k=1)[0]
+        total_weight = sum(probs.values())
+        if total_weight <= 0:
+            logging.error(f"Invalid probabilities in step: {probs}")
+            raise ValueError("Total of weights must be greater than zero")
+        actions, weights = zip(*probs.items())
+        action = random.choices(actions, weights=weights, k=1)[0]
         if action > 1:
             state_tensor = torch.tensor(self.processor.process([state], [player_id], [bets], [stacks], [stage]), 
                                         dtype=torch.float32, device=device)
-            # Переключаем модель в режим eval и отключаем градиенты
             self.strategy_net.eval()
             with torch.no_grad():
                 q_value = self.strategy_net(state_tensor).max().item()
-            # Возвращаем модель в режим train после предсказания
             self.strategy_net.train()
             bet_size = self._dynamic_bet_size(state, stacks, bets, player_id, q_value, stage)
             if bet_size >= stacks[player_id] and 3 in state.legal_actions(player_id):
@@ -438,7 +452,6 @@ class PokerAgent(policy.Policy):
         self.strategy_pool.append(strategy_dict)
         self.cumulative_strategies.clear()
         logging.info(f"Strategy pool updated, size: {len(self.strategy_pool)}")
-
 # Сбор опыта
 @ray.remote(num_cpus=1, num_gpus=0.125)
 def collect_experience(game, agent, processor, steps, worker_id):
