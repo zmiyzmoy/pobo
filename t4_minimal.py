@@ -515,27 +515,33 @@ class Trainer:
         self.buffer = PrioritizedReplayBuffer(config.BUFFER_CAPACITY)
         self.global_step = 0
         self.beta = 0.4
+        self.reward_normalizer = RewardNormalizer()  # Добавляем нормализатор
         self.load_checkpoint()
 
     def load_checkpoint(self):
-        checkpoint_path = config.MODEL_PATH
-        logging.debug(f"Checking for checkpoint at {checkpoint_path}")
-        if os.path.exists(checkpoint_path):
-            try:
-                checkpoint = torch.load(checkpoint_path)
-                self.agent.regret_net.load_state_dict(checkpoint['regret_net'])
-                self.agent.strategy_net.load_state_dict(checkpoint['strategy_net'])
-                self.agent.optimizer.load_state_dict(checkpoint['optimizer'])
-                self.buffer.buffer = checkpoint['buffer']
-                self.buffer.priorities = checkpoint['priorities']
-                self.buffer._max_priority = checkpoint['max_priority']
-                self.global_step = checkpoint['global_step']
-                self.beta = checkpoint['beta']
-                logging.info(f"Loaded checkpoint from {checkpoint_path} at step {self.global_step}")
-            except Exception as e:
-                logging.error(f"Failed to load checkpoint: {str(e)}")
-        else:
-            logging.info(f"No checkpoint found at {checkpoint_path}, starting fresh")
+    checkpoint_path = config.MODEL_PATH
+    logging.debug(f"Checking for checkpoint at {checkpoint_path}")
+    if os.path.exists(checkpoint_path):
+        try:
+            checkpoint = torch.load(checkpoint_path)
+            self.agent.regret_net.load_state_dict(checkpoint['regret_net'])
+            self.agent.strategy_net.load_state_dict(checkpoint['strategy_net'])
+            self.agent.optimizer.load_state_dict(checkpoint['optimizer'])
+            self.buffer.buffer = checkpoint['buffer']
+            self.buffer.priorities = checkpoint['priorities']
+            self.buffer._max_priority = checkpoint['max_priority']
+            self.global_step = checkpoint['global_step']
+            self.beta = checkpoint['beta']
+            # Загружаем состояние нормализатора
+            self.reward_normalizer.mean = checkpoint.get('reward_mean', 0.0)
+            self.reward_normalizer.std = checkpoint.get('reward_std', 1.0)
+            self.reward_normalizer.count = checkpoint.get('reward_count', 0)
+            self.reward_normalizer.m2 = checkpoint.get('reward_m2', 0.0)
+            logging.info(f"Loaded checkpoint from {checkpoint_path} at step {self.global_step}")
+        except Exception as e:
+            logging.error(f"Failed to load checkpoint: {str(e)}")
+    else:
+        logging.info(f"No checkpoint found at {checkpoint_path}, starting fresh")
 
     def save_checkpoint(self):
         checkpoint_path = config.MODEL_PATH
@@ -552,13 +558,17 @@ class Trainer:
                 'priorities': self.buffer.priorities,
                 'max_priority': self.buffer._max_priority,
                 'global_step': self.global_step,
-                'beta': self.beta
+                'beta': self.beta,
+                # Сохраняем состояние нормализатора
+                'reward_mean': self.reward_normalizer.mean,
+                'reward_std': self.reward_normalizer.std,
+                'reward_count': self.reward_normalizer.count,
+                'reward_m2': self.reward_normalizer.m2
             }
             torch.save(checkpoint, checkpoint_path)
             logging.info(f"Saved checkpoint to {checkpoint_path} at step {self.global_step}")
         except Exception as e:
             logging.error(f"Failed to save checkpoint: {str(e)}")
-
     def run_tournament(self):
         logging.info(f"Starting tournament with {len(self.agent.strategy_pool)} strategies in pool")
         if not self.agent.strategy_pool:
@@ -634,12 +644,23 @@ class Trainer:
                 experiences.extend(worker_experiences)
             
             if experiences:
-                self.buffer.add_batch(experiences)
-                logging.info(f"Collected {len(experiences)} total experiences from {config.NUM_WORKERS} workers")
+                # Нормализуем награды перед добавлением в буфер
+                normalized_experiences = []
+                for exp in experiences:
+                    reward = exp[3]  # Предполагаем, что reward — это 4-й элемент кортежа
+                    self.reward_normalizer.update(reward)
+                    normalized_reward = self.reward_normalizer.normalize(reward)
+                    normalized_exp = (exp[0], exp[1], exp[2], normalized_reward, exp[4], exp[5], exp[6], exp[7], exp[8])
+                    normalized_experiences.append(normalized_exp)
+                
+                self.buffer.add_batch(normalized_experiences)
+                logging.info(f"Collected {len(normalized_experiences)} total experiences from {config.NUM_WORKERS} workers")
                 
                 if len(self.buffer) >= config.BATCH_SIZE:
                     batch, indices, weights = self.buffer.sample(config.BATCH_SIZE, self.beta)
                     states, player_ids, actions, rewards, next_states, dones, bets, stacks, stages = zip(*batch)
+                    # Дальше код остаётся без изменений
+                    # ...
                     
                     opponent_stats = OpponentStats()
                     for exp in experiences:
