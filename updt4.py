@@ -290,8 +290,13 @@ class OpponentStats:
                 self.stats[player_id]['vpip'] += 1
             if action > 1:
                 self.stats[player_id]['pfr'] += 1
+                self.stats[player_id]['3bet_opp'] += 1  # Считаем возможность 3-бета
+                if bet_size > pot:  # Условно считаем 3-бетом, если ставка больше пота
+                    self.stats[player_id]['raises'] += bet_size
         if action == 0:
             self.stats[player_id]['folds'] += 1
+            if stage_idx > 0 and self.stats[player_id]['3bet_opp'] > 0:
+                self.stats[player_id]['fold_to_3bet'] += 1  # Увеличиваем, если фолд после 3-бета
         elif action == 1:
             self.stats[player_id]['calls'] += 1
         elif action > 1:
@@ -303,11 +308,13 @@ class OpponentStats:
 
     def get_metrics(self, player_id: int) -> Dict[str, float]:
         hands = max(self.stats[player_id]['hands'], 1)
+        three_bet_opp = max(self.stats[player_id]['3bet_opp'], 1)
         return {
             'vpip': float(self.stats[player_id]['vpip'] / hands),
             'pfr': float(self.stats[player_id]['pfr'] / hands),
             'af': float(self.stats[player_id]['af']),
-            'last_bet': float(self.stats[player_id]['last_bet'])
+            'last_bet': float(self.stats[player_id]['last_bet']),
+            'fold_to_3bet': float(self.stats[player_id]['fold_to_3bet'] / three_bet_opp)
         }
 
 # Агент с динамическими ставками и эвристическими наградами
